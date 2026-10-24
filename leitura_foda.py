@@ -19,7 +19,7 @@ import tkinter as tk
 from tkinter import colorchooser, filedialog, messagebox
 
 import customtkinter as ctk
-from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps, ImageTk
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont, ImageOps, ImageTk
 
 try:
     from PIL import ImageGrab      # colar imagem da área de transferência
@@ -642,7 +642,7 @@ def dominant_color(img):
 
 
 HERO_H = 130
-DETAIL_HERO = 190
+DETAIL_HERO = 110
 
 
 def hero_pil(img, w, h, color, bg):
@@ -798,6 +798,43 @@ def icon_pil(name, size=20, color=None):
         line([(.38, .2), (.68, .5), (.38, .8)])
     elif name == "dot":
         d.ellipse([.24 * s, .24 * s, .76 * s, .76 * s], fill=color)
+    elif name == "moon":
+        m = Image.new("L", (s, s), 0)
+        md = ImageDraw.Draw(m)
+        md.ellipse([.14 * s, .12 * s, .86 * s, .84 * s], fill=255)
+        md.ellipse([.34 * s, .0 * s, .98 * s, .64 * s], fill=0)
+        im.paste(Image.new("RGBA", (s, s), color), (0, 0), m)
+    elif name == "sun":
+        d.ellipse([.31 * s, .31 * s, .69 * s, .69 * s], outline=color, width=w)
+        for k in range(8):
+            a = k * math.pi / 4
+            line([(.5 + .27 * math.cos(a), .5 + .27 * math.sin(a)), (.5 + .42 * math.cos(a), .5 + .42 * math.sin(a))])
+    elif name == "flame":
+        line([(.5, .06), (.74, .38), (.82, .62), (.7, .86), (.5, .94), (.3, .86), (.18, .62), (.28, .42), (.42, .52)],
+             close=True)
+    elif name == "trophy":
+        line([(.24, .12), (.76, .12), (.7, .46), (.5, .6), (.3, .46)], close=True)
+        line([(.5, .6), (.5, .8)])
+        line([(.32, .88), (.68, .88)])
+        d.arc([.06 * s, .16 * s, .32 * s, .42 * s], 90, 270, fill=color, width=w)
+        d.arc([.68 * s, .16 * s, .94 * s, .42 * s], 270, 450, fill=color, width=w)
+    elif name == "quote":
+        for ox in (.10, .52):
+            d.ellipse([ox * s, .22 * s, (ox + .36) * s, .58 * s], fill=color)
+            d.polygon([(ox * s, .40 * s), ((ox + .20) * s, .50 * s), ((ox - .02) * s, .80 * s)], fill=color)
+    elif name == "crown":
+        line([(.1, .8), (.1, .3), (.3, .52), (.5, .18), (.7, .52), (.9, .3), (.9, .8)], close=True)
+    elif name == "tag":
+        line([(.12, .12), (.52, .12), (.9, .5), (.52, .9), (.12, .5)], close=True)
+        d.ellipse([.24 * s, .24 * s, .36 * s, .36 * s], fill=color)
+    elif name == "gem":
+        line([(.28, .18), (.72, .18), (.92, .42), (.5, .88), (.08, .42)], close=True)
+        line([(.08, .42), (.92, .42)])
+        line([(.38, .42), (.5, .88), (.62, .42)])
+    elif name == "target":
+        d.ellipse([.1 * s, .1 * s, .9 * s, .9 * s], outline=color, width=w)
+        d.ellipse([.3 * s, .3 * s, .7 * s, .7 * s], outline=color, width=w)
+        d.ellipse([.44 * s, .44 * s, .56 * s, .56 * s], fill=color)
     return im
 
 
@@ -833,7 +870,7 @@ def avatar_img(path, name, size, bg, ring=None):
     return ctk.CTkImage(avatar_pil(path, name, int(size * ss()), bg, ring), size=(size, size))
 
 
-def banner_pil(path, w, h, bg, accent):
+def banner_pil(path, w, h, bg, accent, fade=(0.18, 0.42)):
     """Banner que se dissolve na cor de fundo na parte de baixo."""
     w = max(300, int(w))
     base = None
@@ -850,7 +887,7 @@ def banner_pil(path, w, h, bg, accent):
             d.line([(x, 0), (x, h)], fill=mix(c1, c2, x / w), width=2)
     mask = Image.new("L", (1, h))
     for y in range(h):
-        t = (y - 0.18 * h) / (0.42 * h)
+        t = (y - fade[0] * h) / (fade[1] * h)
         mask.putpixel((0, y), int(255 * max(0, min(1, t))))
     mask = mask.resize((w, h))
     return Image.composite(Image.new("RGB", (w, h), bg), base, mask)
@@ -865,22 +902,116 @@ def banner_img(path, w, h, bg, accent):
 TIER_COLOR = {"bronze": "#cd7f32", "prata": "#c3cad9", "ouro": "#ffc233"}
 
 
-def badge_pil(ic, tier, earned, size=56):
+_BADGE_CACHE = {}
+
+
+def badge_pil(ic, tier, earned, size=56, prog=None):
+    """Medalha: anel com degradê da cor do nível (ouro tem borda recortada), miolo escuro, brilho e, se ainda
+    não foi conquistada, um arco de progresso."""
+    key = (ic, tier, earned, size, None if prog is None else round(prog, 2), P["surface"], P["accent"])
+    got = _BADGE_CACHE.get(key)
+    if got is not None:
+        return got
     s = size * 4
-    col = TIER_COLOR[tier] if earned else mix(P["muted"], P["surface"], .55)
+    base = TIER_COLOR[tier]
+    if earned:
+        light, dark, glyph_c = mix(base, "#ffffff", .5), mix(base, "#000000", .38), mix(base, "#ffffff", .5)
+        core = mix(base, "#000000", .80)
+    else:
+        light, dark = mix(P["muted"], P["surface"], .5), mix(P["muted"], P["surface"], .8)
+        glyph_c, core = mix(P["muted"], P["surface"], .35), P["surface2"]
+    cx = cy = s / 2
+    R = s / 2 - s * 0.05
+    mask = Image.new("L", (s, s), 0)
+    md = ImageDraw.Draw(mask)
+    if tier == "ouro" and earned:
+        pts = []
+        for k in range(180):
+            a_ = k * 2 * math.pi / 180
+            r = R * (0.955 + 0.045 * math.cos(14 * a_))
+            pts.append((cx + r * math.cos(a_), cy + r * math.sin(a_)))
+        md.polygon(pts, fill=255)
+    else:
+        md.ellipse([cx - R, cy - R, cx + R, cy + R], fill=255)
+    grad = ImageOps.flip(Image.linear_gradient("L").resize((s, s)))
+    ring = ImageOps.colorize(grad, dark, light).convert("RGBA")
     im = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+    im.paste(ring, (0, 0), mask)
     d = ImageDraw.Draw(im)
-    d.ellipse([3, 3, s - 4, s - 4], fill=mix(col, P["surface"], .82) if earned else P["surface2"],
-              outline=col, width=max(3, int(s * 0.05)))
-    g = int(size * 0.5)
-    glyph = icon_pil(ic, g, col)
-    off = (s - glyph.size[0]) // 2
-    im.paste(glyph, (off, off), glyph)
-    return im.resize((size, size), Image.LANCZOS)
+    r2 = R * 0.80
+    d.ellipse([cx - r2, cy - r2, cx + r2, cy + r2], fill=core)
+    d.ellipse([cx - r2, cy - r2, cx + r2, cy + r2], outline=mix(light, dark, .45), width=max(2, int(s * 0.012)))
+    if earned:
+        hl = Image.new("RGBA", (s, s), (0, 0, 0, 0))                       # luz suave no alto do miolo
+        ImageDraw.Draw(hl).ellipse([cx - r2 * .78, cy - r2 * .98, cx + r2 * .78, cy - r2 * .05],
+                                   fill=(255, 255, 255, 38))
+        hlm = Image.new("L", (s, s), 0)
+        ImageDraw.Draw(hlm).ellipse([cx - r2, cy - r2, cx + r2, cy + r2], fill=255)
+        hl = hl.filter(ImageFilter.GaussianBlur(s * 0.045))
+        hl.putalpha(ImageChops.multiply(hl.getchannel("A"), hlm))
+        im.alpha_composite(hl)
+        glow = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+        gd = ImageDraw.Draw(glow)
+        gd.ellipse([cx - r2 * .9, cy - r2 * .9, cx + r2 * .9, cy + r2 * .9], fill=hex_rgba(base, 46))
+        im.alpha_composite(glow.filter(ImageFilter.GaussianBlur(s * 0.05)))
+        d = ImageDraw.Draw(im)
+        d.arc([cx - R * .92, cy - R * .92, cx + R * .92, cy + R * .92], 200, 290, fill=(255, 255, 255, 120),
+              width=max(3, int(s * 0.03)))
+    if prog is not None and not earned and prog > 0:
+        d.arc([cx - R * .90, cy - R * .90, cx + R * .90, cy + R * .90], -90, -90 + 360 * min(1.0, prog),
+              fill=P["accent"], width=max(4, int(s * 0.065)))
+    g = int(size * 0.46)
+    glyph = icon_pil(ic, g, "#ffffff")
+    gw = glyph.size[0]
+    alpha = glyph.getchannel("A").filter(ImageFilter.MaxFilter(3))          # traço um pouco mais grosso
+    off = (s - gw) // 2
+    shadow = Image.new("RGBA", (gw, gw), (0, 0, 0, 0))
+    shadow.paste((0, 0, 0, 150), (0, 0), alpha)
+    shadow = shadow.filter(ImageFilter.GaussianBlur(max(2, s * 0.012)))
+    im.alpha_composite(shadow, (off, off + int(s * 0.014)))
+    gl = ImageOps.colorize(ImageOps.flip(Image.linear_gradient("L").resize((gw, gw))),
+                           mix(glyph_c, "#000000", .22), mix(glyph_c, "#ffffff", .55)).convert("RGBA")
+    gl.putalpha(alpha)
+    im.alpha_composite(gl, (off, off))
+    out = im.resize((size, size), Image.LANCZOS)
+    if len(_BADGE_CACHE) > 400:
+        _BADGE_CACHE.clear()
+    _BADGE_CACHE[key] = out
+    return out
 
 
-def badge_img(ic, tier, earned, size=56):
-    return ctk.CTkImage(badge_pil(ic, tier, earned, int(size * ss())), size=(size, size))
+def medal_frames(ic, tier, earned, size, prog=None, n=12):
+    """Animação ao passar o mouse: a medalha dá um pulinho, balança um pouco e recebe um brilho que a atravessa."""
+    R = size
+    base = badge_pil(ic, tier, earned, R * 2, prog)
+    C = int(R * 1.5)
+    alpha = base.getchannel("A")
+    frames = []
+    for f in range(n):
+        t = f / (n - 1)
+        sc = 1 + 0.12 * min(1.0, t * 3) + 0.10 * math.sin(math.pi * min(1.0, t * 1.6))
+        ang = 9 * math.sin(2 * math.pi * t * 1.5) * (1 - t)
+        fr = base.copy()
+        if earned:
+            pos = (-0.25 + 1.5 * t) * R * 4
+            band = Image.new("L", base.size, 0)
+            bd = ImageDraw.Draw(band)
+            wd = R * 0.5
+            bd.polygon([(pos, 0), (pos + wd, 0), (pos + wd - R * 2, R * 2), (pos - R * 2, R * 2)], fill=150)
+            band = band.filter(ImageFilter.GaussianBlur(R * 0.12))
+            band = ImageChops.multiply(band, alpha)
+            fr.alpha_composite(Image.merge("RGBA", (Image.new("L", base.size, 255),) * 3 + (band,)))
+        fr = fr.rotate(ang, resample=Image.BICUBIC)
+        d_ = max(2, int(R * sc))
+        fr = fr.resize((d_, d_), Image.LANCZOS)
+        canvas = Image.new("RGBA", (C, C), (0, 0, 0, 0))
+        canvas.alpha_composite(fr, ((C - d_) // 2, (C - d_) // 2))
+        frames.append(canvas)
+    return frames
+
+
+def badge_img(ic, tier, earned, size=56, prog=None):
+    return ctk.CTkImage(badge_pil(ic, tier, earned, int(size * ss()), prog), size=(size, size))
 
 
 @functools.lru_cache(maxsize=256)
@@ -996,6 +1127,16 @@ def make_share_image(app, path):
         img = Image.composite(Image.new("RGB", (W, H), accent), img, gm)
     except Exception:
         pass
+    show = showcase_badges(app)
+    if show:
+        bs, gp = 96, 16
+        pw_ = len(show) * bs + (len(show) - 1) * gp + 40
+        ov = Image.new("RGBA", img.size, (0, 0, 0, 0))
+        ImageDraw.Draw(ov).rounded_rectangle([W - 48 - pw_, 40, W - 48, 40 + bs + 40], radius=30, fill=(11, 11, 18, 175))
+        img = Image.alpha_composite(img.convert("RGBA"), ov).convert("RGB")
+        for n_, b in enumerate(show):
+            bi = badge_pil(b["icon"], b["tier"], True, bs * 2).resize((bs, bs), Image.LANCZOS)
+            img.paste(bi, (W - 48 - pw_ + 20 + n_ * (bs + gp), 60), bi)
     d = ImageDraw.Draw(img)
 
     def T(xy, text, size, fill, bold=False, anchor="la"):
@@ -2317,10 +2458,10 @@ BADGES = [
     ("primeira", "Primeira leitura", "Adicione sua primeira leitura à lista", "book", "bronze", "n_items", 1),
     ("completa1", "Primeira completa", "Termine uma leitura", "check", "bronze", "done", 1),
     ("completa10", "Dez completas", "Termine 10 leituras", "check", "prata", "done", 10),
-    ("completa50", "Leitor veterano", "Termine 50 leituras", "check", "ouro", "done", 50),
+    ("completa50", "Leitor veterano", "Termine 50 leituras", "trophy", "ouro", "done", 50),
     ("meta", "Meta batida", "Bata a meta de leituras completas do ano", "flag", "prata", "done_year", None),
-    ("seq7", "Semana inteira", "Leia por 7 dias seguidos", "play", "prata", "longest", 7),
-    ("seq30", "Mês sem parar", "Leia por 30 dias seguidos", "play", "ouro", "longest", 30),
+    ("seq7", "Semana inteira", "Leia por 7 dias seguidos", "flame", "prata", "longest", 7),
+    ("seq30", "Mês sem parar", "Leia por 30 dias seguidos", "flame", "ouro", "longest", 30),
     ("mes100", "Maratonista", "Leia 100 capítulos em um único mês", "chart", "prata", "best_month", 100),
     ("cap1000", "Mil capítulos", "Some 1000 capítulos lidos", "book", "ouro", "chapters", 1000),
     ("hora10", "Dez horas", "Registre 10 horas no cronômetro de leitura", "clock", "bronze", "hours", 10),
@@ -2330,25 +2471,93 @@ BADGES = [
     ("colecao", "Colecionador", "Marque 50 volumes como seus", "library", "prata", "owned", 50),
     ("releitor", "Releitor", "Releia uma obra", "play", "bronze", "rereads", 1),
     ("favoritos", "Coração mole", "Favorite 5 leituras", "heart", "bronze", "favs", 5),
-    ("matinal", "Matinal", "Leia de manhã cedo (entre 5h e 9h)", "clock", "bronze", "morning", 1),
+    ("matinal", "Matinal", "Leia de manhã cedo (entre 5h e 9h)", "sun", "bronze", "morning", 1),
     ("dia20", "Dia de foco", "Leia 20 capítulos num único dia", "chart", "bronze", "max_day", 20),
     ("epico200", "Épico", "Termine uma obra com 200 ou mais capítulos", "check", "prata", "big_done", 1),
-    ("saga500", "Saga completa", "Termine uma obra com 500 ou mais capítulos", "check", "ouro", "huge_done", 1),
+    ("saga500", "Saga completa", "Termine uma obra com 500 ou mais capítulos", "trophy", "ouro", "huge_done", 1),
     ("cap5000", "Cinco mil capítulos", "Some 5000 capítulos lidos", "book", "ouro", "chapters", 5000),
-    ("completa100", "Centenário", "Termine 100 leituras", "check", "ouro", "done", 100),
+    ("completa100", "Centenário", "Termine 100 leituras", "crown", "ouro", "done", 100),
+    ("completa25", "Quarto de cem", "Termine 25 leituras", "trophy", "prata", "done", 25),
+    ("cap10000", "Dez mil capítulos", "Some 10000 capítulos lidos", "crown", "ouro", "chapters", 10000),
+    ("hora50", "Cinquenta horas", "Registre 50 horas no cronômetro de leitura", "clock", "prata", "hours", 50),
+    ("hora500", "Quinhentas horas", "Registre 500 horas no cronômetro de leitura", "clock", "ouro", "hours", 500),
+    ("seq14", "Quinzena", "Leia por 14 dias seguidos", "flame", "prata", "longest", 14),
+    ("seq100", "Cem dias", "Leia por 100 dias seguidos", "flame", "ouro", "longest", 100),
+    ("mes300", "Maratonista supremo", "Leia 300 capítulos em um único mês", "chart", "ouro", "best_month", 300),
+    ("critico50", "Crítico veterano", "Dê nota a 50 leituras", "star", "ouro", "rated", 50),
+    ("obraprima", "Obra-prima", "Dê nota 5 a 5 leituras", "gem", "prata", "rated5", 5),
+    ("colecao200", "Biblioteca de volumes", "Marque 200 volumes como seus", "library", "ouro", "owned", 200),
+    ("semfronteiras", "Sem fronteiras", "Leia os 5 tipos de obra", "target", "ouro", "types", 5),
+    ("favoritos20", "Muito amor", "Favorite 20 leituras", "heart", "prata", "favs", 20),
+    ("estante100", "Estante cheia", "Tenha 100 leituras na lista", "library", "prata", "n_items", 100),
+    ("estante250", "Acervo gigante", "Tenha 250 leituras na lista", "library", "ouro", "n_items", 250),
+    ("citacoes10", "Caçador de frases", "Salve 10 citações ou anotações", "quote", "bronze", "quotes", 10),
+    ("citacoes50", "Colecionador de frases", "Salve 50 citações ou anotações", "quote", "prata", "quotes", 50),
+    ("listas3", "Organizado", "Use 3 listas diferentes", "list", "bronze", "lists", 3),
+    ("releitor5", "Fã incondicional", "Some 5 releituras", "play", "prata", "rereads", 5),
+    ("explorador", "Explorador de gêneros", "Leia obras de 10 gêneros diferentes", "tag", "prata", "tags", 10),
+    ("relampago", "Relâmpago", "Comece e termine uma obra de 20+ capítulos no mesmo dia", "flame", "prata",
+     "done_same_day", 1),
+    ("velocista", "Velocista", "Termine uma obra de 50+ capítulos em até 7 dias", "flame", "ouro", "done_fast", 1),
+    ("multitarefa", "Multitarefa", "Tenha 5 leituras em andamento ao mesmo tempo", "list", "bronze", "n_reading", 5),
+    ("terror", "Outubro de terror", "Leia 3 obras de terror ou suspense em outubro", "moon", "prata", "terror_oct", 3),
+    ("fimdeano", "Maratona de fim de ano", "Leia 50 capítulos entre 26 e 31 de dezembro", "star", "prata",
+     "yearend", 50),
 ]
 
 
 SECRET_BADGES = [
-    ("coruja", "Coruja", "Leia de madrugada (entre meia-noite e 5h)", "clock", "prata", "night", 1),
+    ("coruja", "Coruja", "Leia de madrugada (entre meia-noite e 5h)", "moon", "prata", "night", 1),
     ("maratona50", "Maratona", "Leia 50 capítulos num único dia", "chart", "ouro", "max_day", 50),
     ("trinca", "Trinca", "Termine 3 obras na mesma semana", "check", "ouro", "week_done", 3),
     ("anonovo", "Ano novo, leitura nova", "Leia no dia 1º de janeiro", "star", "prata", "newyear", 1),
+    ("natal", "Leitura de Natal", "Leia no dia 25 de dezembro", "gem", "prata", "christmas", 1),
+    ("coruja20", "Coruja veterana", "Leia 20 capítulos de madrugada", "moon", "ouro", "night", 20),
+    ("voltaporcima", "Volta por cima", "Retome uma leitura parada há mais de 1 ano", "play", "ouro", "comeback", 1),
+    ("domingo", "Domingo de leitura", "Leia 30 capítulos num domingo", "sun", "prata", "sunday", 30),
+    ("sexta13", "Sexta-feira 13", "Leia numa sexta-feira 13", "gem", "prata", "friday13", 1),
 ]
+
+LEGENDARY = {"seq100", "hora500", "completa100", "estante250", "cap10000", "saga500", "coruja20", "semfronteiras",
+             "mes300", "voltaporcima"}
+RARITY = {"Comum": "#9296c0", "Rara": "#4dd0e1", "Épica": "#b86bff", "Lendária": "#ffc233"}
+CATS = ["Leitura", "Tempo", "Sequências", "Coleção", "Avaliação", "Datas"]
+KEY_CAT = {"done": "Leitura", "done_year": "Leitura", "big_done": "Leitura", "huge_done": "Leitura",
+           "chapters": "Leitura", "max_day": "Leitura", "best_month": "Leitura", "week_done": "Leitura",
+           "done_same_day": "Leitura", "done_fast": "Leitura", "n_reading": "Leitura", "types": "Leitura",
+           "tags": "Leitura", "rereads": "Leitura", "hours": "Tempo", "morning": "Tempo", "night": "Tempo",
+           "longest": "Sequências", "comeback": "Sequências", "n_items": "Coleção", "owned": "Coleção",
+           "lists": "Coleção", "rated": "Avaliação", "rated5": "Avaliação", "quotes": "Avaliação",
+           "favs": "Avaliação", "newyear": "Datas", "christmas": "Datas", "terror_oct": "Datas",
+           "yearend": "Datas", "sunday": "Datas", "friday13": "Datas"}
+FAMILY = {"chapters": "Capítulos lidos", "hours": "Horas de leitura", "done": "Leituras completas",
+          "longest": "Dias seguidos", "best_month": "Capítulos no mês", "rated": "Notas dadas",
+          "favs": "Favoritas", "owned": "Volumes", "n_items": "Tamanho da lista", "quotes": "Citações",
+          "rereads": "Releituras"}
+
+
+def badge_rarity(b):
+    return "Lendária" if b["id"] in LEGENDARY else {"bronze": "Comum", "prata": "Rara", "ouro": "Épica"}[b["tier"]]
+
+
+def _wd(k):
+    try:
+        return date.fromisoformat(k).weekday()
+    except ValueError:
+        return -1
+
+
+def _yearend(act):
+    out = Counter()
+    for k, v in act.items():
+        if k[5:7] == "12" and k[8:10] >= "26":
+            out[k[:4]] += v.get("ch", 0)
+    return out
 
 
 def badge_status(app):
     items, act = app.items, app.activity
+    dates = app.profile.get("badge_dates", {})
     year = date.today().year
     months = Counter()
     for k, v in act.items():
@@ -2370,6 +2579,27 @@ def badge_status(app):
         big_done=sum(1 for i in items if i["status"] == "completo" and max(i["total"], i["seen"]) >= 200),
         huge_done=sum(1 for i in items if i["status"] == "completo" and max(i["total"], i["seen"]) >= 500), max_day=max([v.get("ch", 0) for v in act.values()] or [0]),
         week_done=max(list(weeks.values()) or [0]),
+        quotes=sum(len(i["quotes"]) for i in items), lists=len({n for i in items for n in i["lists"]}),
+        tags=len({t.strip().lower() for i in items if i["seen"] > 0 for t in i["tags"] if t.strip()}),
+        rated5=sum(1 for i in items if i["rating"] >= 5),
+        christmas=1 if any(k.endswith("-12-25") and (v.get("ch", 0) > 0 or v.get("min", 0) > 0)
+                           for k, v in act.items()) else 0,
+        done_same_day=sum(1 for i in items if i["status"] == "completo" and max(i["total"], i["seen"]) >= 20
+                          and parse_date(i["started"]) and parse_date(i["started"]) == parse_date(i["finished"])),
+        done_fast=sum(1 for i in items if i["status"] == "completo" and max(i["total"], i["seen"]) >= 50
+                      and parse_date(i["started"]) and parse_date(i["finished"])
+                      and 0 <= (parse_date(i["finished"]) - parse_date(i["started"])).days <= 7),
+        n_reading=sum(1 for i in items if i["status"] == "lendo"),
+        comeback=1 if any(e["kind"] == "resume" and n > 0 and e["ts"] - ev[n - 1]["ts"] >= 365 * 86400
+                          for i in items for ev in [sorted(i.get("history", []), key=lambda e: e["ts"])]
+                          for n, e in enumerate(ev)) else 0,
+        terror_oct=sum(1 for i in items if i["seen"] > 0
+                       and any(t.strip().lower() in ("terror", "horror", "suspense") for t in i["tags"])
+                       and any(d_ and d_.month == 10 for d_ in (parse_date(i["started"]), parse_date(i["finished"])))),
+        yearend=max(list(_yearend(act).values()) or [0]),
+        sunday=max([v.get("ch", 0) for k, v in act.items() if _wd(k) == 6] or [0]),
+        friday13=1 if any(_wd(k) == 4 and k.endswith("-13") and (v.get("ch", 0) > 0 or v.get("min", 0) > 0)
+                          for k, v in act.items()) else 0,
         newyear=1 if any(k.endswith("-01-01") and (v.get("ch", 0) > 0 or v.get("min", 0) > 0)
                          for k, v in act.items()) else 0)
     out = []
@@ -2378,8 +2608,30 @@ def badge_status(app):
             need = need if need is not None else max(1, S["goal"])
             have = ctx[key]
             out.append(dict(id=bid, title=title, desc=desc, icon=ic, tier=tier, have=have, need=need,
-                            earned=have >= need, secret=secret))
+                            earned=have >= need, secret=secret, key=key, cat=KEY_CAT.get(key, "Leitura"),
+                            date=dates.get(bid, "")))
     return out
+
+
+def badge_status_cached(app):
+    c = getattr(app, "_bs_cache", None)
+    if c and c[0] == DATA["v"]:
+        return c[1]
+    r = badge_status(app)
+    app._bs_cache = (DATA["v"], r)
+    return r
+
+
+def showcase_badges(app):
+    by = {b["id"]: b for b in badge_status_cached(app)}
+    return [by[i] for i in app.profile.get("showcase", []) if i in by and by[i]["earned"]][:3]
+
+
+def fmt_badge_date(iso):
+    try:
+        return date.fromisoformat(iso).strftime("%d/%m/%Y")
+    except ValueError:
+        return ""
 
 
 def panel_badges(parent, app, limit=8):
@@ -2945,6 +3197,7 @@ def c_heat(d, x, y, w, act):
 
 # ---- blocos e a "tela" que os mostra ----
 class Blk:
+    medals = ()      # medalhas que ganham animação ao passar o mouse: [{name, cx, cy, size, spec}]
     tip = None  # função(nome da região) -> obra, para o cartão rápido da estante
 
     def __init__(self, key, x, y, w, h, draw, regs=(), act=None, item=None):
@@ -2959,6 +3212,7 @@ class BlockView:
         self.app, self.sf, self.cv, self.fn = app, sf, sf.canvas, layout_fn
         self.blocks, self.live, self.refs, self.photos = [], {}, {}, OrderedDict()
         self.hov, self._job, self._rz = (None, None), None, None
+        self._an, self._fcache = None, OrderedDict()
         sf.virtual = self
         try:
             self.cv.itemconfigure(sf._win, state="hidden")
@@ -2985,7 +3239,60 @@ class BlockView:
         self.cv.configure(scrollregion=(0, 0, max(1, cw), total))
         return True
 
+    def _an_stop(self):
+        an, self._an = self._an, None
+        if an:
+            try:
+                self.app.after_cancel(an["job"])
+            except Exception:
+                pass
+            try:
+                self.cv.delete(an["item"])
+            except tk.TclError:
+                pass
+
+    def _an_check(self, i, name):
+        if i is None or not name or not str(name).startswith("m") or not self.blocks[i].medals:
+            return self._an_stop()
+        if self._an and self._an["key"] == (i, name):
+            return
+        m = next((m for m in self.blocks[i].medals if m["name"] == name), None)
+        if m is None:
+            return self._an_stop()
+        self._an_stop()
+        k = scale_k()
+        b = self.blocks[i]
+        size = max(8, int(m["size"] * k))
+        ic, tier, earned, prog = m["spec"]
+        fk = (ic, tier, earned, size, None if prog is None else round(prog, 2), P["accent"])
+        frames = self._fcache.get(fk)
+        if frames is None:
+            try:
+                frames = [ImageTk.PhotoImage(f) for f in medal_frames(ic, tier, earned, size, prog)]
+            except Exception:
+                return
+            self._fcache[fk] = frames
+            while len(self._fcache) > 24:
+                self._fcache.popitem(last=False)
+        else:
+            self._fcache.move_to_end(fk)
+        item = self.cv.create_image(int((b.x + m["cx"]) * k), int((b.y + m["cy"]) * k), image=frames[0],
+                                    anchor="center")
+        self._an = {"key": (i, name), "item": item, "job": None}
+
+        def step(n=0):
+            if not self._an or self._an["item"] != item:
+                return
+            try:
+                self.cv.itemconfigure(item, image=frames[n])
+            except tk.TclError:
+                return
+            if n < len(frames) - 1:
+                self._an["job"] = self.app.after(26, lambda: step(n + 1))
+        step()
+
     def clear_items(self):
+        self._an_stop()
         for i in list(self.live):
             try:
                 self.cv.delete(self.live[i])
@@ -3120,6 +3427,7 @@ class BlockView:
         old = self.hov
         if (i, name) == old:
             return
+        self._an_check(i, name)
         self.hov = (i, name)
         if old[0] is not None and old[0] != i:
             self._set(old[0], None)
@@ -3150,6 +3458,7 @@ class BlockView:
             return
         old = self.hov
         self.hov = (None, None)
+        self._an_stop()
         if old[0] is not None:
             self._set(old[0], None)
         preview_hide()
@@ -3172,8 +3481,9 @@ class BlockView:
 
 # ---- painéis ----
 class PanelSpec:
-    def __init__(self, title, nat, body, head=None, regs=None, act=None):
+    def __init__(self, title, nat, body, head=None, regs=None, act=None, medals=None):
         self.title, self.nat, self.body, self.head, self.regs, self.act = title, nat, body, head, regs, act
+        self.medals = medals
 
     def block(self, key, x, y, w, h):
         spec = self
@@ -3185,8 +3495,12 @@ class PanelSpec:
             spec.body(img, d, w, h, hov)
             return img
 
-        regs = spec.regs(w, h) if spec.regs else []
-        return Blk(key, x, y, w, h, draw, regs, spec.act)
+        ml = spec.medals(w, h) if spec.medals else []
+        regs = [(m["cx"] - m["size"] / 2, m["cy"] - m["size"] / 2, m["cx"] + m["size"] / 2, m["cy"] + m["size"] / 2,
+                 m["name"]) for m in ml] + (spec.regs(w, h) if spec.regs else [])
+        blk = Blk(key, x, y, w, h, draw, regs, spec.act)
+        blk.medals = ml
+        return blk
 
 
 def _link_btn(img, d, x, y, w, text, hov, name):
@@ -3402,37 +3716,60 @@ def spec_level(app):
 
 
 def spec_badges(app, view):
-    st = badge_status(app)
+    st = badge_status_cached(app)
     visible = [b for b in st if not b["secret"] or b["earned"]]
     hidden = len(st) - len(visible)
     got = sum(1 for b in visible if b["earned"])
-    shown = sorted(visible, key=lambda b: not b["earned"])[:8]
-    rows = -(-len(shown) // 4)
+    rank = {"ouro": 0, "prata": 1, "bronze": 2}
+    best = sorted([b for b in visible if b["earned"]], key=lambda b: rank[b["tier"]])[:4]
+    near = sorted([b for b in visible if not b["earned"]], key=lambda b: -min(1, b["have"] / b["need"]))[:4]
+    secs = [x for x in (("Em destaque", best), ("Quase lá", near)) if x[1]]
+    ROW, SEC = 106, 24
+
+    def total(w):
+        return HEAD + len(secs) * (SEC + ROW) + (20 if hidden else 0) + 36 + 14
 
     def head(img, d, w):
         T(d, w - 16, 24, f"{got} de {len(visible)}", 12, P["muted"], anchor="rm")
 
+    def medals(w, h):
+        cw, y, out = (w - 20) / 4, HEAD, []
+        for label, lst in secs:
+            y += SEC
+            for k_, b in enumerate(lst):
+                pr = None if b["earned"] else min(1, b["have"] / b["need"])
+                out.append(dict(name=f"m{len(out)}", cx=10 + (k_ + .5) * cw, cy=y + 30, size=56,
+                                spec=(b["icon"], b["tier"], b["earned"], pr)))
+            y += ROW
+        return out
+
     def body(img, d, w, h, hov):
         cw = (w - 20) / 4
-        for k_, b in enumerate(shown):
-            cx = 10 + (k_ % 4 + .5) * cw
-            y = HEAD + (k_ // 4) * 92
-            bi = badge_pil(b["icon"], b["tier"], b["earned"], 52 * K)
-            img.paste(bi, (int((cx - 26) * K), int((y + 4) * K)), bi)
-            for n, line in enumerate(wrap_l(b["title"], 10, 70, maxlines=2)):
-                T(d, cx, y + 60 + n * 13, line, 11, P["text"] if b["earned"] else P["muted"], False, "ma")
-        y = HEAD + rows * 92
+        y = HEAD
+        for label, lst in secs:
+            T(d, 16, y + 4, label, 12, P["muted"], True)
+            y += SEC
+            for k_, b in enumerate(lst):
+                cx = 10 + (k_ + .5) * cw
+                pr = None if b["earned"] else min(1, b["have"] / b["need"])
+                bi = badge_pil(b["icon"], b["tier"], b["earned"], 56 * K, pr)
+                img.paste(bi, (int((cx - 28) * K), int((y + 2) * K)), bi)
+                for n, line in enumerate(wrap_l(b["title"], 10, 76, maxlines=2)):
+                    T(d, cx, y + 62 + n * 13, line, 11, P["text"] if b["earned"] else P["muted"], False, "ma")
+                if not b["earned"]:
+                    T(d, cx, y + 90, f"{int(min(b['have'], b['need']))}/{int(b['need'])}", 10, P["accent"], True, "ma")
+            y += ROW
         if hidden:
             T(d, 16, y + 2, f"+ {hidden} conquistas secretas por descobrir", 11, P["muted"])
             y += 20
         _link_btn(img, d, 12, y, w - 24, "Ver todas as conquistas", hov, "all")
 
     def regs(w, h):
-        y = HEAD + rows * 92 + (20 if hidden else 0)
+        y = HEAD + len(secs) * (SEC + ROW) + (20 if hidden else 0)
         return [(12, y, w - 12, y + 36, "all")]
 
-    return PanelSpec("Conquistas", lambda w: HEAD + rows * 92 + (20 if hidden else 0) + 36 + 14, body, head=head,
-                     regs=regs, act=lambda n: app.open_sub(BadgesPage))
+    return PanelSpec("Conquistas", total, body, head=head, regs=regs, medals=medals,
+                     act=lambda n: app.open_sub(BadgesPage))
 
 
 def spec_review(app):
@@ -3482,58 +3819,124 @@ def spec_strip(app):
 
 
 # ---------- perfil ----------
+HBH = 300          # altura do cabeçalho do perfil
+
+
+def _hdr_geom(app, w, pr, lv):
+    """Posições do cabeçalho (compartilhadas entre o desenho e as áreas de clique/animação)."""
+    AV = 116
+    ix = 26 + AV + 22
+    right = 190                              # largura reservada à direita (nível, favoritos...)
+    bio = wrap_l(pr["bio"], 14, max(160, w - ix - right - 24), maxlines=2) if pr["bio"] else []
+    total = 44 + 34 + (len(bio) * 20 + 4 if bio else 0) + 28
+    y0 = max(24, HBH - 22 - total)
+    handle_w = TW(ImageDraw.Draw(Image.new("RGB", (4, 4))), pr["handle"], 15)
+    medals = []
+    for n_, b in enumerate(showcase_badges(app)):
+        medals.append(dict(name=f"m{n_}", cx=ix + handle_w + 20 + 15 + n_ * 34, cy=y0 + 44 + 15, size=30,
+                           spec=(b["icon"], b["tier"], True, None), badge=b))
+    return dict(AV=AV, ix=ix, bio=bio, y0=y0, medals=medals, right=right)
+
+
 def profile_header(app, w, hov, pr, lv):
-    BH, AV = 270, 112
-    H = BH + 2 + 36
+    BH, g = HBH, _hdr_geom(app, w, pr, lv)
+    AV, ix, y0, bio = g["AV"], g["ix"], g["y0"], g["bio"]
     bg = P["bg"]
-    img = Image.new("RGBA", (w * K, H * K), bg)
+    items = app.items
 
     def path(key):
         n = pr.get(key)
         return profile_dir() / n if n else None
 
-    img.paste(banner_pil(path("banner"), w * K, BH * K, bg, P["accent"]), (0, 0))
+    img = Image.new("RGBA", (w * K, BH * K), bg)
+    img.paste(banner_pil(path("banner"), w * K, BH * K, bg, P["accent"], fade=(0.62, 0.38)), (0, 0))
+    shade_ = Image.new("RGBA", img.size, (0, 0, 0, 0))                  # escurece a metade de baixo p/ o texto
+    sd = ImageDraw.Draw(shade_)
+    for yy in range(int(BH * K * .38), BH * K):
+        t = (yy - BH * K * .38) / (BH * K * .62)
+        sd.line([(0, yy), (w * K, yy)], fill=(8, 8, 14, int(150 * min(1, t * 1.2))))
+    img.alpha_composite(shade_)
+    # avatar
     av = avatar_pil(path("avatar"), pr["name"], AV * K, bg, lv["color"])
-    img.paste(av, (26 * K, (BH - AV - 8) * K))
+    am = Image.new("L", (AV * K * 4, AV * K * 4), 0)
+    ImageDraw.Draw(am).ellipse([0, 0, AV * K * 4 - 1, AV * K * 4 - 1], fill=255)
+    img.paste(av, (26 * K, (BH - AV - 22) * K), am.resize((AV * K, AV * K), Image.LANCZOS))
     d = ImageDraw.Draw(img)
-    ix = 26 + AV + 18
-    bio = wrap_l(pr["bio"], 13, max(160, w - AV - 90), maxlines=3) if pr["bio"] else []
-    info_h = 38 + 22 + 32 + (len(bio) * 19 + 2 if bio else 0)
-    y0 = max(20, BH - 12 - info_h)
-    T(d, ix, y0, pr["name"], 30, P["text"], True)
-    T(d, ix, y0 + 40, pr["handle"], 14, P["accent"])
-    ry = y0 + 66
-    pt = f" Nível {lv['level']} · {lv['title']} "
-    pw = TW(d, pt, 12, True) + 4
-    d.rounded_rectangle([ix * K, ry * K, (ix + pw) * K, (ry + 24) * K], radius=8 * K,
-                        fill=mix(lv["color"], bg, .78))
-    T(d, ix + pw / 2, ry + 12, pt, 12, lv["color"], True, "mm")
-    bx = ix + pw + 10
-    d.rounded_rectangle([bx * K, (ry + 9) * K, (bx + 110) * K, (ry + 15) * K], radius=3 * K, fill=P["surface2"])
-    fw = 110 * lv["frac"]
+    # linha 1: nome + título do nível
+    T(d, ix, y0, pr["name"], 32, "#ffffff", True)
+    nw = TW(d, pr["name"], 32, True)
+    chip = f" {lv['title']} "
+    cw_ = TW(d, chip, 12, True) + 8
+    cx0 = ix + nw + 14
+    d.rounded_rectangle([cx0 * K, (y0 + 10) * K, (cx0 + cw_) * K, (y0 + 32) * K], radius=6 * K,
+                        fill=mix(lv["color"], "#000000", .55), outline=mix(lv["color"], "#000000", .15), width=K)
+    T(d, cx0 + cw_ / 2, y0 + 21, chip, 12, mix(lv["color"], "#ffffff", .25), True, "mm")
+    # linha 2: @ e vitrine
+    T(d, ix, y0 + 44, pr["handle"], 15, P["accent"], False, "lm")
+    d2 = d
+    for m in g["medals"]:
+        bi = badge_pil(m["spec"][0], m["spec"][1], True, 30 * K)
+        img.paste(bi, (int((m["cx"] - 15) * K), int((m["cy"] - 15) * K)), bi)
+    # bio
+    yy = y0 + 70
+    for line in bio:
+        T(d, ix, yy, line, 14, "#c9cbe0")
+        yy += 20
+    # contagens
+    yy += 6 if bio else 0
+    done = sum(1 for i in items if i["status"] == "completo")
+    nlists = len({n for i in items for n in i["lists"]})
+    x = ix
+    for val, lab in ((len(items), "Leituras"), (done, "Completas"), (nlists, "Listas")):
+        T(d, x, yy + 10, str(val), 15, "#ffffff", True, "lm")
+        x += TW(d, str(val), 15, True) + 5
+        T(d, x, yy + 10, lab, 14, "#a9acc6", False, "lm")
+        x += TW(d, lab, 14) + 22
+    # botões de ícone no canto
+    ov = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    od = ImageDraw.Draw(ov)
+    bx = w - 16 - 3 * 42 - 2 * 8
+    for n_, (name, ic) in enumerate((("tier", "star"), ("share", "share"), ("edit", "edit"))):
+        x0 = bx + n_ * 50
+        od.rounded_rectangle([x0 * K, 16 * K, (x0 + 42) * K, 58 * K], radius=10 * K,
+                             fill=(P["accent"] if hov == name else (10, 10, 18, 185)),
+                             outline=(255, 255, 255, 40), width=K)
+    img.alpha_composite(ov)
+    for n_, (name, ic) in enumerate((("tier", "star"), ("share", "share"), ("edit", "edit"))):
+        paste_ico(img, ic, 20, "#ffffff", bx + n_ * 50 + 11, 27)
+    # caixa do nível (direita)
+    d = ImageDraw.Draw(img)
+    rx = w - 16 - 164
+    ov = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    od = ImageDraw.Draw(ov)
+    od.rounded_rectangle([rx * K, (BH - 140) * K, (rx + 164) * K, (BH - 76) * K], radius=10 * K, fill=(10, 10, 18, 185),
+                         outline=(255, 255, 255, 40), width=K)
+    favs = sum(1 for i in items if i["favorite"])
+    od.rounded_rectangle([rx * K, (BH - 68) * K, (rx + 164) * K, (BH - 36) * K], radius=10 * K, fill=(10, 10, 18, 185),
+                         outline=(255, 255, 255, 40), width=K)
+    img.alpha_composite(ov)
+    d = ImageDraw.Draw(img)
+    T(d, rx + 82, BH - 124, f"Nível {lv['level']}", 18, "#ffffff", True, "mm")
+    d.rounded_rectangle([(rx + 20) * K, (BH - 106) * K, (rx + 144) * K, (BH - 100) * K], radius=3 * K, fill=P["surface2"])
+    fw = 124 * lv["frac"]
     if fw > 0:
-        d.rounded_rectangle([bx * K, (ry + 9) * K, (bx + max(fw, 6)) * K, (ry + 15) * K], radius=3 * K,
+        d.rounded_rectangle([(rx + 20) * K, (BH - 106) * K, (rx + 20 + max(fw, 6)) * K, (BH - 100) * K], radius=3 * K,
                             fill=lv["color"])
-    T(d, bx + 110 + 6, ry + 12, f"{lv['xp'] - lv['cur']}/{lv['nxt'] - lv['cur']} XP", 11, P["muted"], anchor="lm")
-    for n, line in enumerate(bio):
-        T(d, ix, ry + 34 + n * 19, line, 13, P["muted"])
-    # botões
-    by = BH + 2
-    flat_h = mix(P["surface2"], P["accent"], .38)
-    draw_btn(img, (w - 150, by, w, by + 36), "Editar perfil", P["accent_hover"] if hov == "edit" else P["accent"],
-             "#ffffff", ("edit", "#ffffff"))
-    draw_btn(img, (w - 308, by, w - 158, by + 36), "Compartilhar", flat_h if hov == "share" else P["surface2"],
-             P["text"], ("share", P["text"]))
-    draw_btn(img, (w - 446, by, w - 316, by + 36), "Tier list", flat_h if hov == "tier" else P["surface2"],
-             P["text"], ("star", P["text"]))
+    T(d, rx + 82, BH - 90, f"{lv['xp'] - lv['cur']}/{lv['nxt'] - lv['cur']} XP", 11, "#a9acc6", False, "mm")
+    paste_ico(img, "heart_fill", 16, PINK, rx + 44, BH - 60)
+    T(d, rx + 68, BH - 52, f"{favs} favorito{'s' if favs != 1 else ''}", 14, "#ffffff", True, "lm")
+    born = [i["created"] for i in items if i.get("created")]
+    if born:
+        dt = datetime.fromtimestamp(min(born))
+        T(d, w - 16, BH - 18, f"Desde {MESES[dt.month - 1]}. de {dt.year}", 13, "#a9acc6", anchor="rm")
     return img
 
 
 class ImgPage(Page):
     """Página cujo conteúdo é uma lista de imagens (blocos) desenhadas direto no canvas."""
 
-    def __init__(self, app, title=None):
-        super().__init__(app, title)
+    def __init__(self, app, title=None, back=False):
+        super().__init__(app, title, back=back)
         self.view = BlockView(app, self.scroll, self.layout)
         self.after(40, self.view.rebuild)
 
@@ -3598,13 +4001,19 @@ class ProfilePage(ImgPage):
 
         def hdr_draw(hov):
             return profile_header(app, LW, hov, pr, lv)
-        BH = 270
-        out.append(Blk("hdr", pad, y, LW, BH + 38, hdr_draw,
-                       [(LW - 150, BH + 2, LW, BH + 38, "edit"), (LW - 308, BH + 2, LW - 158, BH + 38, "share"),
-                        (LW - 446, BH + 2, LW - 316, BH + 38, "tier")],
-                       lambda n: {"edit": lambda: app.open_sub(ProfileEditPage), "share": app.share_image,
-                                  "tier": lambda: app.open_sub(TierPage)}[n]()))
-        y += BH + 38 + 10
+        BH = HBH
+        bx0 = LW - 16 - 3 * 42 - 2 * 8
+        g = _hdr_geom(app, LW, pr, lv)
+        hb = Blk("hdr-" + str(len(g["medals"])), pad, y, LW, BH, hdr_draw,
+                 [(m["cx"] - m["size"] / 2, m["cy"] - m["size"] / 2, m["cx"] + m["size"] / 2, m["cy"] + m["size"] / 2,
+                   m["name"]) for m in g["medals"]] +
+                 [(bx0, 16, bx0 + 42, 58, "tier"), (bx0 + 50, 16, bx0 + 92, 58, "share"),
+                  (bx0 + 100, 16, bx0 + 142, 58, "edit")],
+                 lambda n: {"edit": lambda: app.open_sub(ProfileEditPage), "share": app.share_image,
+                            "tier": lambda: app.open_sub(TierPage)}.get(n, lambda: app.open_sub(BadgesPage))())
+        hb.medals = g["medals"]
+        out.append(hb)
+        y += BH + 10
         sp = self.specs["strip"]
         h = sp.nat(LW)
         out.append(sp.block("strip", pad, y, LW, h))
@@ -4321,7 +4730,10 @@ class DetailPage(Page):
             f.pack(fill="x", pady=(14, 0))
             self.wrapped(f, text=it["notes"], text_color=P["text"]).pack(anchor="w", padx=16, pady=(0, 14))
         self.quotes_panel(rc, acc)
-        self.history_panel(rc, acc)
+        self.hist_host = ctk.CTkFrame(rc, fg_color="transparent")
+        self.hist_host.pack(fill="x")
+        self._hl, self._acc = len(it.get("history", [])), acc
+        self.history_panel(self.hist_host, acc)
 
     # ---- citações e anotações por capítulo ----
     def quotes_panel(self, rc, acc):
@@ -4446,9 +4858,38 @@ class DetailPage(Page):
         self.show_vols()
         self.app.commit(self.it["id"])
 
+    def _sig(self):
+        it = self.it
+        return (bool(stalled_days(it)), bool(self.info_text()))
+
+    def _sync_top(self, sig):
+        """Atualiza no lugar o que muda com o progresso/status; refaz a tela só se algo apareceu ou sumiu."""
+        it = self.it
+        if sig != self._sig() or self.status_btn is None:
+            return self.render()
+        try:
+            sc = P["status"][it["status"]]
+            self.status_btn.configure(text="●  " + STATUS[it["status"]] + "   ▾", fg_color=mix(sc, P["bg"], .8),
+                                      hover_color=mix(sc, P["bg"], .65), text_color=sc,
+                                      border_color=mix(sc, P["bg"], .55))
+            self.cap_lbl.configure(text=self.cap_text())
+            if self.info_lbl is not None:
+                self.info_lbl.configure(text=self.info_text())
+            if self.pbar is not None and it["total"]:
+                self.pbar.set(min(1, it["seen"] / it["total"]))
+            if len(it.get("history", [])) != self._hl:       # novo registro: refaz só o painel do histórico
+                for w in self.hist_host.winfo_children():
+                    w.destroy()
+                self._hl = len(it.get("history", []))
+                self.history_panel(self.hist_host, self._acc)
+        except Exception:
+            self.render()
+
     def plus(self):
-        self.app.add_progress(self.it, 1)
-        self.render()
+        sig = self._sig()
+        if self.app.add_progress(self.it, 1) is False:
+            return
+        self._sync_top(sig)
 
     def toggle_ongoing(self):
         it = self.it
@@ -4534,7 +4975,7 @@ class DetailPage(Page):
             return
         today = date.today().strftime("%d/%m/%Y")
         ev = status_event(old, new)
-        sig = (bool(stalled_days(it)), bool(self.info_text()))
+        sig = self._sig()
         it["status"] = new
         if new == "lendo":
             it["started"] = it["started"] or today
@@ -4547,21 +4988,7 @@ class DetailPage(Page):
         it["updated"] = time.time()
         self.app.commit(it["id"])
         self.app.toast(f"Status: {STATUS[new]}")
-        # troca no lugar (sem refazer a tela); só reconstrói se algo apareceu/sumiu
-        if sig != (bool(stalled_days(it)), bool(self.info_text())) or self.status_btn is None:
-            return self.render()
-        try:
-            sc = P["status"][new]
-            self.status_btn.configure(text="●  " + STATUS[new] + "   ▾", fg_color=mix(sc, P["bg"], .8),
-                                      hover_color=mix(sc, P["bg"], .65), text_color=sc,
-                                      border_color=mix(sc, P["bg"], .55))
-            self.cap_lbl.configure(text=self.cap_text())
-            if self.info_lbl is not None:
-                self.info_lbl.configure(text=self.info_text())
-            if self.pbar is not None and it["total"]:
-                self.pbar.set(min(1, it["seen"] / it["total"]))
-        except Exception:
-            self.render()
+        self._sync_top(sig)
 
     def tick(self):
         if not self.winfo_exists():
@@ -4573,54 +5000,241 @@ class DetailPage(Page):
         self.after(1000, self.tick)
 
 
-class BadgesPage(Page):
-    MAXW = 900
+class BadgesPage(ImgPage):
+    MAXW = 980
+    FILTERS = ["Todas", "Conquistadas", "Em progresso", "Secretas"]
 
     def __init__(self, app):
+        self.filter, self.cat = "Todas", "Todas"
+        self.st = badge_status(app)
         super().__init__(app, "Conquistas", back=True)
-        st = badge_status(app)
-        visible = [b for b in st if not b["secret"] or b["earned"]]
-        hidden = [b for b in st if b["secret"] and not b["earned"]]
-        got = sum(1 for b in visible if b["earned"])
-        extra = f"  •  {len(hidden)} secretas por descobrir" if hidden else ""
-        ctk.CTkLabel(self.col, text=f"{got} de {len(visible)} conquistadas{extra}", text_color=P["muted"]).pack(
-            anchor="w", padx=8, pady=(0, 6))
-        grid = ctk.CTkFrame(self.col, fg_color="transparent")
-        grid.pack(fill="x")
-        self.cards = []
-        for b in sorted(visible, key=lambda b: not b["earned"]) + hidden:
-            secret = b["secret"] and not b["earned"]
-            f = ctk.CTkFrame(grid, fg_color=P["surface"], corner_radius=14, border_width=1, border_color=P["border"])
-            ctk.CTkLabel(f, text="", image=badge_img("lock" if secret else b["icon"], b["tier"], b["earned"], 56)).pack(
-                side="left", padx=14, pady=12)
-            t = ctk.CTkFrame(f, fg_color="transparent")
-            t.pack(side="left", fill="x", expand=True, padx=(0, 14))
-            ctk.CTkLabel(t, text="Conquista secreta" if secret else b["title"],
-                         text_color=P["text"] if b["earned"] else P["muted"],
-                         font=ctk.CTkFont(size=15, weight="bold"), anchor="w").pack(anchor="w")
-            ctk.CTkLabel(t, text="Continue lendo para descobrir…" if secret else b["desc"], text_color=P["muted"],
-                         font=ctk.CTkFont(size=12), wraplength=260, justify="left", anchor="w").pack(anchor="w")
-            if not secret:
-                pb = ctk.CTkProgressBar(t, height=6, fg_color=P["surface2"], progress_color=TIER_COLOR[b["tier"]])
-                pb.set(min(1, b["have"] / b["need"]))
-                pb.pack(fill="x", pady=(6, 0))
-                tag = "  •  secreta" if b["secret"] else ""
-                ctk.CTkLabel(t, text=f"{int(min(b['have'], b['need']))}/{int(b['need'])}  •  {b['tier']}{tag}",
-                             text_color=P["muted"], font=ctk.CTkFont(size=11)).pack(anchor="w")
-            self.cards.append(f)
-        self.grid_host, self._ncols = grid, 0
-        grid.bind("<Configure>", self._layout)
 
-    def _layout(self, e):
-        n = 2 if lw(e.width) >= 640 else 1
-        if n == self._ncols:
-            return
-        self._ncols = n
-        for k, c in enumerate(self.cards):
-            c.grid_forget()
-            c.grid(row=k // n, column=k % n, sticky="nsew", padx=6, pady=6)
-        for c in range(2):
-            self.grid_host.grid_columnconfigure(c, weight=1 if c < n else 0)
+    # ---- dados: conquistas com etapas viram um cartão só ----
+    def _entries(self):
+        st = self.st
+        fam = {}
+        for b in st:
+            if not b["secret"] and b["key"] in FAMILY:
+                fam.setdefault(b["key"], []).append(b)
+        ents, seen = [], set()
+        for b in st:
+            k = b["key"]
+            if not b["secret"] and k in fam and len(fam[k]) > 1:
+                if k in seen:
+                    continue
+                seen.add(k)
+                steps = sorted(fam[k], key=lambda x: x["need"])
+                got = [x for x in steps if x["earned"]]
+                nxt = next((x for x in steps if not x["earned"]), None)
+                cur = got[-1] if got else None
+                shown = nxt if nxt else steps[-1]
+                pct = min(1, shown["have"] / shown["need"])
+                ents.append(dict(kind="fam", id=k, steps=steps, cur=cur, nxt=nxt, cat=b["cat"], secret=False,
+                                 any=bool(got), done=nxt is None, pct=pct, title=FAMILY[k]))
+            else:
+                ents.append(dict(kind="one", b=b, id=b["id"], cur=b if b["earned"] else None, cat=b["cat"],
+                                 secret=b["secret"], any=b["earned"], done=b["earned"],
+                                 pct=1 if b["earned"] else min(1, b["have"] / b["need"])))
+        return ents
+
+    def _lists(self):
+        rank = {"ouro": 0, "prata": 1, "bronze": 2}
+        out = []
+        for e in self._entries():
+            if self.cat != "Todas" and e["cat"] != self.cat:
+                continue
+            f = self.filter
+            if f == "Conquistadas" and not e["any"]:
+                continue
+            if f == "Em progresso" and (e["done"] or (e["secret"] and not e["any"])):
+                continue
+            if f == "Secretas" and not e["secret"]:
+                continue
+            out.append(e)
+
+        def key(e):
+            locked = e["secret"] and not e["any"]
+            grp = 2 if locked else (0 if e["done"] else 1)
+            tier = rank[(e["cur"] or (e["b"] if e["kind"] == "one" else e["steps"][0]))["tier"]]
+            return (grp, tier if grp == 0 else 0, -e["pct"])
+        return sorted(out, key=key)
+
+    def _summary(self, w):
+        st = self.st
+        vis = [b for b in st if not b["secret"] or b["earned"]]
+        got = sum(1 for b in vis if b["earned"])
+        hidden = len(st) - len(vis)
+
+        def draw(hov):
+            img, d = panel_img(w, 112)
+            T(d, 20, 16, f"{got} de {len(vis)} conquistadas", 20, P["text"], True)
+            if hidden:
+                T(d, w - 20, 24, f"{hidden} secretas por descobrir", 12, P["muted"], anchor="rm")
+            bw = w - 40
+            d.rounded_rectangle([20 * K, 52 * K, (20 + bw) * K, 60 * K], radius=4 * K, fill=P["surface2"])
+            if got:
+                d.rounded_rectangle([20 * K, 52 * K, (20 + bw * got / max(1, len(vis))) * K, 60 * K], radius=4 * K,
+                                    fill=P["accent"])
+            x = 20
+            for tier in ("bronze", "prata", "ouro"):
+                tv = [b for b in vis if b["tier"] == tier]
+                tg = sum(1 for b in tv if b["earned"])
+                bi = badge_pil("star", tier, True, 26 * K)
+                img.paste(bi, (int(x * K), int(72 * K)), bi)
+                T(d, x + 34, 85, f"{tg}/{len(tv)} {tier}", 13, P["text"], True, "lm")
+                x += 34 + TW(d, f"{tg}/{len(tv)} {tier}", 13, True) + 26
+            T(d, w - 20, 85, "Clique numa conquistada para fixar no perfil (até 3)", 12, P["muted"], anchor="rm")
+            return img
+        return Blk(f"sum-{got}-{w}-{len(self.app.profile.get('showcase', []))}", 0, 0, w, 112, draw)
+
+    def _chips(self, w, names, cur, setter, tag):
+        tmp = ImageDraw.Draw(Image.new("RGB", (4, 4)))
+        boxes, x = [], 0
+        for n in names:
+            bw = TW(tmp, n, 13, True) + 30
+            boxes.append((x, 0, x + bw, 34, n))
+            x += bw + 8
+
+        def draw(hov):
+            img = Image.new("RGBA", (w * K, 34 * K), (0, 0, 0, 0))
+            for i, (x0, y0, x1, y1, n) in enumerate(boxes):
+                on = n == cur
+                fill = P["accent"] if on else (P["surface2"] if hov == f"f{i}" else P["surface"])
+                draw_btn(img, (x0, y0, x1, y1), n, fill, "#ffffff" if on else P["text"], size=13, radius=17)
+            return img
+        regs = [(x0, y0, x1, y1, f"f{i}") for i, (x0, y0, x1, y1, n) in enumerate(boxes)]
+
+        def act(name):
+            setter(names[int(name[1:])])
+            self.view.rebuild()
+        return Blk(f"{tag}-{cur}-{w}", 0, 0, w, 34, draw, regs, act)
+
+    def _pin(self, bid):
+        pr = self.app.profile
+        sh = [i for i in pr.get("showcase", [])]
+        if bid in sh:
+            sh.remove(bid)
+            msg = "Conquista removida do perfil"
+        else:
+            sh.append(bid)
+            sh = sh[-3:]
+            msg = "Conquista fixada no perfil"
+        pr["showcase"] = sh
+        save_profile(pr)
+        self.app.toast(msg)
+        self.view.rebuild()
+
+    def _card(self, e, w, h):
+        app = self.app
+        secret = e["secret"] and not e["any"]
+        pinned = set(app.profile.get("showcase", []))
+
+        def draw(hov):
+            img, d = panel_img(w, h)
+            if hov in ("pin", "m0") and e["cur"]:
+                d.rounded_rectangle([0, 0, w * K - 1, h * K - 1], radius=14 * K, outline=P["accent"], width=2 * K)
+            x = 100
+            if e["kind"] == "fam":
+                cur, nxt, steps = e["cur"], e["nxt"], e["steps"]
+                med = cur or steps[0]
+                shown = nxt or steps[-1]
+                pr_ = None if cur and not nxt else min(1, shown["have"] / shown["need"])
+                bi = badge_pil(med["icon"], med["tier"], bool(cur), 68 * K, None if cur else pr_)
+                title = e["title"]
+                desc = (f"Próxima etapa: {nxt['title']} — {nxt['desc']}" if nxt else "Todas as etapas concluídas!")
+                tier_col = TIER_COLOR[shown["tier"]]
+                frac = 1 if not nxt else min(1, nxt["have"] / nxt["need"])
+                tag = (f"{int(min(shown['have'], shown['need']))}/{int(shown['need'])}  •  "
+                       f"etapa {sum(1 for t in steps if t['earned'])}/{len(steps)}")
+                for n, t in enumerate(reversed(steps)):
+                    mb = badge_pil(t["icon"], t["tier"], t["earned"], 22 * K)
+                    img.paste(mb, (int((w - 16 - (n + 1) * 26) * K), int(12 * K)), mb)
+                tw_max = w - x - 18 - len(steps) * 26
+                ref = cur
+            else:
+                b = e["b"]
+                pr_ = None if b["earned"] else min(1, b["have"] / b["need"])
+                bi = badge_pil("lock" if secret else b["icon"], b["tier"], b["earned"], 68 * K, None if secret else pr_)
+                title = "Conquista secreta" if secret else b["title"]
+                desc = "Continue lendo para descobrir…" if secret else b["desc"]
+                tier_col = TIER_COLOR[b["tier"]]
+                frac = min(1, b["have"] / b["need"])
+                tag = f"{int(min(b['have'], b['need']))}/{int(b['need'])}  •  {b['tier']}" + ("  •  secreta" if b["secret"] else "")
+                tw_max = w - x - 18
+                ref = b if b["earned"] else None
+                if not secret:
+                    rar = badge_rarity(b)
+                    rw = TW(d, rar, 10, True) + 14
+                    d.rounded_rectangle([(w - 16 - rw) * K, 14 * K, (w - 16) * K, 30 * K], radius=8 * K,
+                                        fill=mix(RARITY[rar], P["surface"], .78))
+                    T(d, w - 16 - rw / 2, 22, rar, 10, RARITY[rar], True, "mm")
+                    tw_max = w - x - 18 - rw - 8
+            img.paste(bi, (int(16 * K), int((h - 68) / 2 * K)), bi)
+            T(d, x, 14, title, 15, P["text"] if e["any"] else P["muted"], True)
+            for n, line in enumerate(wrap_l(desc, 12, w - x - 18, maxlines=2)):
+                T(d, x, 38 + n * 16, line, 12, P["muted"])
+            if not secret:
+                d.rounded_rectangle([x * K, 76 * K, (w - 18) * K, 82 * K], radius=3 * K, fill=P["surface2"])
+                if frac > 0:
+                    d.rounded_rectangle([x * K, 76 * K, (x + (w - 18 - x) * frac) * K, 82 * K], radius=3 * K,
+                                        fill=tier_col)
+                T(d, x, 90, tag, 11, P["muted"])
+                if ref:
+                    when = fmt_badge_date(ref.get("date", ""))
+                    if when:
+                        T(d, w - 18, 90, f"conquistada em {when}", 11, P["muted"], anchor="ra")
+            if ref and ref["id"] in pinned:
+                lab = "no perfil"
+                pw_ = TW(d, lab, 10, True) + 22
+                d.rounded_rectangle([(w - 16 - pw_) * K, (h - 48) * K, (w - 16) * K, (h - 32) * K], radius=8 * K,
+                                    fill=mix(P["accent"], P["surface"], .75))
+                T(d, w - 16 - pw_ / 2, h - 40, lab, 10, P["accent"], True, "mm")
+            return img
+        return draw
+
+    def layout(self, avail):
+        pad = max(14, int((avail - self.MAXW) // 2)) + 8
+        W = int(avail - 2 * pad)
+        out, y = [], 8
+        pinned = tuple(self.app.profile.get("showcase", []))
+        for blk, hh in ((self._summary(W), 112),
+                        (self._chips(W, self.FILTERS, self.filter, lambda v: setattr(self, "filter", v), "fs"), 34),
+                        (self._chips(W, ["Todas"] + CATS, self.cat, lambda v: setattr(self, "cat", v), "ct"), 34)):
+            blk.x, blk.y = pad, y
+            out.append(blk)
+            y += hh + 12
+        y += 4
+        n = 2 if W >= 640 else 1
+        gap, h = 14, 106
+        cw = (W - gap * (n - 1)) // n
+        lst = self._lists()
+        for k, e in enumerate(lst):
+            r, c = divmod(k, n)
+            ref = e["cur"]
+            regs = [(0, 0, cw, h, "pin")] if ref else []
+            act = (lambda nm, ref=ref: self._pin(ref["id"])) if ref else None
+            blk = Blk(f"b-{self.filter}-{self.cat}-{e['id']}-{cw}-{pinned}", pad + c * (cw + gap),
+                      y + r * (h + gap), cw, h, self._card(e, cw, h), regs, act)
+            if e["kind"] == "fam":
+                med = e["cur"] or e["steps"][0]
+                nx = e["nxt"] or e["steps"][-1]
+                spec = (med["icon"], med["tier"], bool(e["cur"]),
+                        None if (e["cur"] and not e["nxt"]) or e["cur"] else min(1, nx["have"] / nx["need"]))
+            else:
+                b_ = e["b"]
+                spec = ("lock" if (e["secret"] and not e["any"]) else b_["icon"], b_["tier"], b_["earned"],
+                        None if (b_["earned"] or e["secret"]) else min(1, b_["have"] / b_["need"]))
+            blk.medals = [dict(name="m0", cx=16 + 34, cy=h / 2, size=68, spec=spec)]
+            blk.regs = [(16, (h - 68) / 2, 84, (h + 68) / 2, "m0")] + blk.regs
+            out.append(blk)
+        y += -(-len(lst) // n) * (h + gap)
+        if not lst:
+            def empty(hov, w=W):
+                img = Image.new("RGBA", (w * K, 30 * K), (0, 0, 0, 0))
+                T(ImageDraw.Draw(img), 4, 4, "Nenhuma conquista nesta categoria ainda.", 14, P["muted"])
+                return img
+            out.append(Blk("empty", pad, y, W, 30, empty))
+        return out
 
 
 class YearReviewPage(Page):
@@ -5827,6 +6441,7 @@ class App(ctk.CTk):
         self.build()
         splash_step(splash, 0.8)
         self.nav("profile")
+        self.after(1500, lambda: self.check_badges(True))
         splash_step(splash, 1.0)
         self._finish_splash(splash)
 
@@ -6477,8 +7092,89 @@ class App(ctk.CTk):
         self.refresh()
 
     # --- estado ---
+    def check_badges(self, quiet=False):
+        """Descobre conquistas novas, guarda a data e mostra o aviso (as que já eram suas entram sem festa)."""
+        self._cb_job = None
+        try:
+            st = badge_status(self)
+        except Exception:
+            return
+        pr = self.profile
+        known = set(pr.get("badge_known", []))
+        dates = pr.setdefault("badge_dates", {})
+        new, changed = [], False
+        for b in st:
+            if b["id"] not in known:
+                known.add(b["id"])
+                changed = True
+                if b["earned"] and b["id"] not in dates:
+                    dates[b["id"]] = ""
+            elif b["earned"] and b["id"] not in dates:
+                dates[b["id"]] = date.today().isoformat()
+                changed = True
+                new.append(b)
+        if changed:
+            pr["badge_known"] = sorted(known)
+            save_profile(pr)
+        if new and not quiet:
+            self._badge_q = getattr(self, "_badge_q", []) + new
+            if getattr(self, "_badge_w", None) is None:
+                self._badge_next()
+
+    def _badge_next(self):
+        q = getattr(self, "_badge_q", [])
+        if not q:
+            self._badge_w = None
+            return
+        b = q.pop(0)
+        rar = badge_rarity(b)
+        f = ctk.CTkFrame(self, fg_color=P["surface"], corner_radius=16, border_width=2,
+                         border_color=TIER_COLOR[b["tier"]])
+        ctk.CTkLabel(f, text="", image=badge_img(b["icon"], b["tier"], True, 64)).pack(side="left", padx=(14, 6), pady=12)
+        t = ctk.CTkFrame(f, fg_color="transparent")
+        t.pack(side="left", padx=(4, 18), pady=12)
+        ctk.CTkLabel(t, text="CONQUISTA DESBLOQUEADA", text_color=P["accent"], anchor="w",
+                     font=ctk.CTkFont(size=10, weight="bold")).pack(anchor="w")
+        ctk.CTkLabel(t, text=b["title"], text_color=P["text"], anchor="w",
+                     font=ctk.CTkFont(size=17, weight="bold")).pack(anchor="w")
+        ctk.CTkLabel(t, text=f"{rar}  •  {b['desc']}", text_color=RARITY[rar], anchor="w", wraplength=300,
+                     justify="left", font=ctk.CTkFont(size=12)).pack(anchor="w")
+        self._badge_w = f
+        steps = 10
+
+        def slide(n=0):
+            try:
+                if not f.winfo_exists():
+                    return
+                x = int(380 * (1 - n / steps) ** 2)
+                f.place(relx=1.0, x=-20 + x, y=22, anchor="ne")
+                f.lift()
+                if n < steps:
+                    self.after(16, lambda: slide(n + 1))
+                else:
+                    self.after(4800, leave)
+            except Exception:
+                pass
+
+        def leave(n=0):
+            try:
+                if not f.winfo_exists():
+                    return
+                f.place(relx=1.0, x=-20 + int(380 * (n / steps) ** 2), y=22, anchor="ne")
+                if n < steps:
+                    self.after(16, lambda: leave(n + 1))
+                else:
+                    f.destroy()
+                    self._badge_w = None
+                    self._badge_next()
+            except Exception:
+                self._badge_w = None
+        slide()
+
     def commit(self, item_id):
         save_items(self.items)
+        if getattr(self, "_cb_job", None) is None:
+            self._cb_job = self.after(500, self.check_badges)
         for k in [k for k in self.images if k[0] == item_id]:
             del self.images[k]
         for k in [k for k in self._pilc if k[0] == item_id]:
