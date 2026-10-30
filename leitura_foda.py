@@ -12,9 +12,9 @@ import re
 import shutil
 import sys
 import time
+import traceback
 import functools
 import unicodedata
-import types as _types
 import uuid
 import webbrowser
 import zipfile
@@ -43,7 +43,7 @@ PINK = "#ff5c8a"
 STATUS = {"lendo": "Lendo", "completo": "Completo", "planejo": "Quero ler",
           "pausado": "Pausado", "largado": "Largado"}
 STATUS_BY_LABEL = {v: k for k, v in STATUS.items()}
-TYPES = ["Mangá", "Manhwa", "Webtoon", "Livro", "Outro"]
+TYPES = ["Mangá", "Manhwa", "Manhua", "Webtoon", "Novel", "Livro", "Outro"]
 SORTS = ["Mais recentes", "Última atualização", "Nome (A–Z)", "Maior nota",
          "Mais capítulos lidos", "Data de início"]
 ACCENTS = ["#8b5cf6", "#3b82f6", "#10b981", "#ec4899", "#f97316", "#ef4444"]
@@ -92,8 +92,8 @@ THEMES = {
 }
 
 # cores por tipo de obra (etiquetas, filtros e gráficos)
-TYPE_COLORS = {"Mangá": "#ff6b81", "Manhwa": "#4dabf7", "Webtoon": "#51cf66", "Livro": "#ffa94d",
-               "Outro": "#9aa0c0"}
+TYPE_COLORS = {"Mangá": "#ff6b81", "Manhwa": "#4dabf7", "Manhua": "#fcc419", "Webtoon": "#51cf66",
+               "Novel": "#b197fc", "Livro": "#ffa94d", "Outro": "#9aa0c0"}
 LABEL_COLORS = ["#f87171", "#fb923c", "#fbbf24", "#4ade80", "#2dd4bf", "#60a5fa", "#a78bfa", "#f472b6",
                 "#ef4444", "#f97316", "#eab308", "#22c55e", "#14b8a6", "#3b82f6", "#8b5cf6", "#ec4899",
                 "#fca5a5", "#fdba74", "#fde047", "#86efac", "#99f6e4", "#93c5fd", "#c4b5fd", "#f9a8d4",
@@ -146,7 +146,7 @@ def detect_dpi(win):
     try:
         return max(1.0, float(ctk.ScalingTracker.get_window_scaling(win)))
     except Exception:
-        pass
+        log_error()
     try:
         return max(1.0, win.winfo_fpixels("1i") / 96.0)
     except Exception:
@@ -187,10 +187,9 @@ def hex_rgba(h, a=255):
 def load_settings():
     s = dict(data_dir=str(APP_DIR), theme="Escuro", accent=ACCENTS[0], view="Grade", goal=20, collapsed=False,
              stall_days=30, daily=5, sounds=True)
-    try:
-        s.update(json.loads(SETTINGS_FILE.read_text(encoding="utf-8")))
-    except (OSError, ValueError):
-        pass
+    got = read_json(SETTINGS_FILE, "configurações")
+    if isinstance(got, dict):
+        s.update(got)
     if s["accent"] == "#7c5cff":      # roxo da versão anterior
         s["accent"] = ACCENTS[0]
     s["theme"] = {"dark": "Escuro", "light": "Claro"}.get(s["theme"], s["theme"])
@@ -205,13 +204,183 @@ def touch():
     DATA["v"] += 1
 
 
+# ---- gravação em segundo plano (o texto é montado na hora; só o disco é lento) ----
+_WQ, _WLOCK, _WEV, _WBUSY = {}, threading.Lock(), threading.Event(), [False]
+_WTHREAD = [None]
+_WFAIL = [None]          # mensagem do último erro de gravação (a tela avisa e limpa)
+_WBAK = {}               # quando foi feita a última cópia ".bak" de cada arquivo
+LOAD_NOTES = []          # avisos de leitura (arquivo corrompido, recuperado do .bak...) mostrados ao abrir
+
+
+def atomic_write(path, data):
+    """Grava num arquivo temporário e troca pelo definitivo: nunca fica um arquivo pela metade."""
+    path = Path(path)
+    tmp = path.with_name(path.name + ".tmp")
+    if isinstance(data, str):
+        tmp.write_text(data, encoding="utf-8")
+    else:
+        tmp.write_bytes(data)
+    tmp.replace(path)
+
+
+def _keep_bak(path):
+    """Guarda a versão anterior (que era válida) como .bak, no máximo a cada 2 minutos."""
+    now = time.time()
+    if path.exists() and now - _WBAK.get(path, 0) > 120:
+        try:
+            shutil.copy2(path, path.with_name(path.name + ".bak"))
+            _WBAK[path] = now
+        except OSError:
+            pass
+
+
+def _writer_loop():
+    while True:
+        _WEV.wait()
+        with _WLOCK:
+            jobs = dict(_WQ)
+            _WQ.clear()
+            _WEV.clear()
+            _WBUSY[0] = True
+        failed = False
+        for path, text in jobs.items():
+            err = None
+            for attempt in range(3):                      # antivírus/OneDrive às vezes seguram o arquivo um instante
+                try:
+                    _keep_bak(path)
+                    atomic_write(path, text)
+                    err = None
+                    break
+                except OSError as e:
+                    err = e
+                    time.sleep(0.4)
+            if err is not None:
+                failed = True
+                _WFAIL[0] = f"{path.name}: {err}"
+                with _WLOCK:
+                    _WQ.setdefault(path, text)            # tenta de novo depois (sem pisar numa gravação mais nova)
+        _WBUSY[0] = False
+        if failed:
+            time.sleep(3)
+            _WEV.set()
+
+
+def write_async(path, text):
+    with _WLOCK:
+        _WQ[path] = text
+        _WEV.set()
+    if _WTHREAD[0] is None or not _WTHREAD[0].is_alive():
+        _WTHREAD[0] = threading.Thread(target=_writer_loop, daemon=True)
+        _WTHREAD[0].start()
+
+
+def flush_saves(timeout=8.0):
+    """Espera as gravações pendentes terminarem (ao fechar, fazer backup, importar ou trocar de pasta)."""
+    t0 = time.time()
+    while (_WQ or _WBUSY[0]) and time.time() - t0 < timeout:
+        time.sleep(0.01)
+
+
+def read_json(path, label):
+    """Lê um JSON. Se estiver ilegível, guarda uma cópia (.corrupt-...) e tenta a última versão boa (.bak);
+    devolve None se o arquivo não existe ou não deu para recuperar (e avisa em LOAD_NOTES)."""
+    path = Path(path)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError:
+        text = None
+    if text is not None:
+        try:
+            return json.loads(text)
+        except ValueError:
+            pass
+    try:                                                   # ilegível: não perde o que sobrou
+        if path.exists():
+            shutil.copy2(path, path.with_name(f"{path.name}.corrupt-{int(time.time())}"))
+    except OSError:
+        pass
+    bak = path.with_name(path.name + ".bak")
+    try:
+        data = json.loads(bak.read_text(encoding="utf-8"))
+        LOAD_NOTES.append(f"O arquivo de {label} estava danificado; recuperei a última cópia boa.")
+        return data
+    except (OSError, ValueError):
+        LOAD_NOTES.append(f"Não consegui ler o arquivo de {label}. Uma cópia dele foi guardada na pasta de dados "
+                          "(.corrupt) e o backup diário está em “backups”.")
+        return None
+
+
+def timer_secs(t):
+    """Segundos de cronômetro. O app confere a cada poucos segundos; se o PC dormiu (intervalo grande), esse
+    intervalo não conta."""
+    if not t:
+        return 0
+    now = time.time()
+    gap = now - t.get("last", now)
+    return int(t.get("acc", 0) + (gap if gap <= 60 else 0))
+
+
+_LOGSEEN = set()
+
+
+def log_error(where="", exc_info=None):
+    """Anota o erro atual em erros.log (na pasta de dados). Cada ponto do código só é anotado uma vez por
+    sessão, para o arquivo não encher; passa de 400 KB e ele é renovado."""
+    try:
+        ei = exc_info or sys.exc_info()
+        if not ei or ei[0] is None:
+            return
+        tb = ei[2]
+        while tb is not None and tb.tb_next is not None:
+            tb = tb.tb_next
+        key = (ei[0].__name__, tb.tb_lineno if tb else 0, tb.tb_frame.f_code.co_name if tb else "")
+        if key in _LOGSEEN:
+            return
+        _LOGSEEN.add(key)
+        try:
+            base = data_dir()
+            base.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            base = APP_DIR
+        path = base / "erros.log"
+        if path.exists() and path.stat().st_size > 400_000:
+            path.replace(path.with_name("erros.antigo.log"))
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"[{datetime.now():%d/%m/%Y %H:%M:%S}] {where}\n"
+                    + "".join(traceback.format_exception(*ei)) + "\n")
+    except Exception:
+        pass
+
+
+class LRUDict(OrderedDict):
+    """Dicionário com teto: ao passar de `cap`, saem os itens usados há mais tempo."""
+
+    def __init__(self, cap=900):
+        super().__init__()
+        self.cap = cap
+
+    def __getitem__(self, k):
+        v = super().__getitem__(k)
+        self.move_to_end(k)
+        return v
+
+    def __setitem__(self, k, v):
+        super().__setitem__(k, v)
+        self.move_to_end(k)
+        while len(self) > self.cap:
+            self.popitem(last=False)
+
+
 def scrolling():
     return time.time() < SCROLL["until"]
 
 
 def save_settings():
+    touch()                                   # metas e opções entram nas contas das conquistas (cache)
     APP_DIR.mkdir(exist_ok=True)
-    SETTINGS_FILE.write_text(json.dumps(S, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write(SETTINGS_FILE, json.dumps(S, ensure_ascii=False, indent=2))
 
 
 def apply_palette():
@@ -262,11 +431,42 @@ def fresh(v):
     return list(v) if isinstance(v, list) else dict(v) if isinstance(v, dict) else v
 
 
+def _fold(s):
+    """Chave para comparar nomes: sem acento, sem maiúsculas, espaços normalizados."""
+    s = unicodedata.normalize("NFKD", str(s or "")).encode("ascii", "ignore").decode().lower()
+    return " ".join(s.split())
+
+
+def unify_names(items, keys=("tags", "lists")):
+    """Junta gêneros/listas escritos de jeitos diferentes (romance / Romance / Romançe...) numa grafia só:
+    a que começa com maiúscula, e entre elas a mais usada. Devolve True se mudou algo."""
+    changed = False
+    for key in keys:
+        groups = {}
+        for it in items:
+            for n in it.get(key) or []:
+                groups.setdefault(_fold(n), Counter())[n] += 1
+        canon = {f: sorted(c.items(), key=lambda kv: (not kv[0][:1].isupper(), -kv[1], kv[0]))[0][0]
+                 for f, c in groups.items()}
+        for it in items:
+            old = it.get(key) or []
+            new = []
+            for n in old:
+                c = canon.get(_fold(n), n)
+                if c and c not in new:
+                    new.append(c)
+            if new != old:
+                it[key] = new
+                changed = True
+    return changed
+
+
 def load_items():
-    try:
-        items = json.loads(data_file().read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    flush_saves()
+    items = read_json(data_file(), "suas leituras")
+    if not isinstance(items, list):
         return []
+    items = [it for it in items if isinstance(it, dict)]
     for it in items:
         for k, v in DEFAULTS.items():
             it.setdefault(k, fresh(v))
@@ -274,13 +474,14 @@ def load_items():
         it.setdefault("updated", it["created"])
         if not it["progressed"]:
             it["progressed"] = it["updated"]
+    unify_names(items)
     return items
 
 
 def save_items(items):
     touch()
     data_dir().mkdir(parents=True, exist_ok=True)
-    data_file().write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_async(data_file(), json.dumps(items, ensure_ascii=False, indent=1))
 
 
 def new_item(**kw):
@@ -311,7 +512,7 @@ def save_shot_image(img):
     try:
         img = ImageOps.exif_transpose(img)
     except Exception:
-        pass
+        log_error()
     alpha = img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info)
     img = img.convert("RGBA" if alpha else "RGB")
     if max(img.size) > SHOT_MAX:
@@ -386,6 +587,72 @@ def del_shot_files(s):
             pass
     _SHT.pop(s["id"], None)
     _SHF.pop(s["id"], None)
+
+
+def trash_dir():
+    return data_dir() / "trash"
+
+
+def trash_item(it):
+    """Move a obra (dados, capa e prints) para a lixeira em vez de apagar. Devolve a pasta dela."""
+    d = trash_dir() / f"{it['id']}_{int(time.time())}"
+    (d / "files").mkdir(parents=True, exist_ok=True)
+    files = []
+    if it.get("cover"):
+        files.append((covers_dir() / it["cover"], "covers"))
+    for sh in it.get("shots", []):
+        files += [(shot_file(sh), "shots"), (shot_thumb_file(sh), "shots")]
+        _SHT.pop(sh["id"], None)
+        _SHF.pop(sh["id"], None)
+    for src, kind in files:
+        try:
+            if src.exists():
+                (d / "files" / kind).mkdir(exist_ok=True)
+                shutil.move(str(src), str(d / "files" / kind / src.name))
+        except OSError:
+            log_error("lixeira: mover arquivo")
+    atomic_write(d / "item.json", json.dumps({"item": it, "deleted": time.time()}, ensure_ascii=False))
+    return d
+
+
+def restore_trash(d):
+    """Traz a obra da lixeira de volta (arquivos incluídos). Devolve o item, ou None se não deu."""
+    d = Path(d)
+    try:
+        it = json.loads((d / "item.json").read_text(encoding="utf-8"))["item"]
+    except (OSError, ValueError, KeyError):
+        return None
+    for kind, dst in (("covers", covers_dir()), ("shots", shots_dir())):
+        src = d / "files" / kind
+        if src.exists():
+            dst.mkdir(parents=True, exist_ok=True)
+            for f in src.iterdir():
+                try:
+                    shutil.move(str(f), str(dst / f.name))
+                except OSError:
+                    log_error("lixeira: restaurar arquivo")
+    shutil.rmtree(d, ignore_errors=True)
+    return it
+
+
+def list_trash():
+    """[(pasta, item, instante da exclusão)], da mais recente para a mais antiga."""
+    out = []
+    base = trash_dir()
+    if base.exists():
+        for d in base.iterdir():
+            try:
+                j = json.loads((d / "item.json").read_text(encoding="utf-8"))
+                out.append((d, j["item"], float(j.get("deleted", 0))))
+            except (OSError, ValueError, KeyError):
+                continue
+    return sorted(out, key=lambda e: -e[2])
+
+
+def purge_old_trash(days=30):
+    for d, _it, ts in list_trash():
+        if time.time() - ts > days * 86400:
+            shutil.rmtree(d, ignore_errors=True)
 
 
 def purge_shots(it):
@@ -470,17 +737,14 @@ def activity_file():
 
 
 def load_activity():
-    try:
-        a = json.loads(activity_file().read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
+    a = read_json(activity_file(), "atividade")
     return a if isinstance(a, dict) else {}
 
 
 def save_activity(a):
     touch()
     data_dir().mkdir(parents=True, exist_ok=True)
-    activity_file().write_text(json.dumps(a, ensure_ascii=False), encoding="utf-8")
+    write_async(activity_file(), json.dumps(a, ensure_ascii=False))
 
 
 def log_activity(a, ch=0, minutes=0, day=None, hour=None):
@@ -624,8 +888,9 @@ STATUS_ALIASES = {_norm(k): v for k, v in {
     "pausado": "pausado", "on hold": "pausado", "paused": "pausado",
     "largado": "largado", "dropped": "largado", "abandonado": "largado"}.items()}
 
-TYPE_ALIASES = {"manga": "Mangá", "manhwa": "Manhwa", "webtoon": "Webtoon", "livro": "Livro",
-                "book": "Livro", "novel": "Livro", "light_novel": "Livro"}
+TYPE_ALIASES = {"manga": "Mangá", "manhwa": "Manhwa", "manhua": "Manhua", "webtoon": "Webtoon", "livro": "Livro",
+                "book": "Livro", "novel": "Novel", "light_novel": "Novel", "light novel": "Novel",
+                "web novel": "Novel", "webnovel": "Novel", "ln": "Novel"}
 
 
 def _num(s, default=0.0):
@@ -667,7 +932,8 @@ def import_csv(path):
         out.append(new_item(
             title=title, type=TYPE_ALIASES.get(_norm(r.get("tipo")), "Outro"),
             status=STATUS_ALIASES.get(_norm(r.get("status")), "planejo"),
-            seen=int(_num(r.get("capitulo_atual"))), total=int(_num(r.get("total"))), rating=score,
+            seen=min(int(_num(r.get("capitulo_atual"))), int(_num(r.get("total"))) or 10 ** 9),
+            total=int(_num(r.get("total"))), rating=score,
             author=r.get("autor", ""), year=r.get("ano", ""),
             tags=[t.strip() for t in re.split(r"[;|,]", r.get("generos", "")) if t.strip()],
             url=r.get("link", ""), started=_date(r.get("inicio")), finished=_date(r.get("fim")),
@@ -694,7 +960,9 @@ EVENT_STYLE = {
 # ---- sons suaves (gerados aqui mesmo, sem arquivos de áudio) ----
 _SND = {}
 SOUND_NOTES = {"done": [(523.25, 0.00), (659.25, 0.11), (783.99, 0.22)],
-               "badge": [(783.99, 0.00), (987.77, 0.10), (1174.66, 0.20), (1567.98, 0.32)]}
+               "badge": [(783.99, 0.00), (987.77, 0.10), (1174.66, 0.20), (1567.98, 0.32)],
+               "platina": [(783.99, 0.00), (987.77, 0.09), (1174.66, 0.18), (1567.98, 0.27), (1975.53, 0.38),
+                           (2349.32, 0.50), (3135.96, 0.64)]}
 
 
 def _tone_wav(kind):
@@ -710,7 +978,7 @@ def _tone_wav(kind):
             v = (math.sin(2 * math.pi * f * t) + 0.25 * math.sin(2 * math.pi * f * 2 * t)) * env
             i = n0 + k
             if i < len(buf):
-                buf[i] = max(-32000, min(32000, buf[i] + int(v * 4200)))
+                buf[i] = max(-32000, min(32000, buf[i] + int(v * 9500)))
     bio = io.BytesIO()
     with wave.open(bio, "wb") as w:
         w.setnchannels(1)
@@ -720,20 +988,56 @@ def _tone_wav(kind):
     return bio.getvalue()
 
 
-def play_sound(kind):
-    """Toque curto e suave (só no Windows; nos outros sistemas fica em silêncio)."""
-    if not S.get("sounds", True):
+_SND_LOCK = threading.Lock()
+
+
+def play_sound(kind, force=False):
+    """Toque curto e suave (só no Windows; nos outros sistemas fica em silêncio).
+    Toca em fila: o som da conquista espera o da obra terminar, em vez de cortá-lo."""
+    if not force and not S.get("sounds", True):
         return
 
     def run():
-        try:
-            import winsound
-            if kind not in _SND:
-                _SND[kind] = _tone_wav(kind)
-            winsound.PlaySound(_SND[kind], winsound.SND_MEMORY | winsound.SND_ASYNC)
-        except Exception:
-            pass
+        with _SND_LOCK:
+            try:
+                import winsound
+            except Exception:
+                return
+            try:
+                if kind not in _SND:
+                    _SND[kind] = _tone_wav(kind)
+                winsound.PlaySound(_SND[kind], winsound.SND_MEMORY)       # síncrono dentro da thread
+            except Exception:
+                try:                                                      # plano B: bipes simples
+                    for f, _t in SOUND_NOTES[kind]:
+                        winsound.Beep(int(f), 110)
+                except Exception:
+                    log_error()
     threading.Thread(target=run, daemon=True).start()
+
+
+def pause_if_caught_up(it):
+    """Leitura 'Lendo', em lançamento e em dia (leu tudo o que saiu) vai para 'Pausado' sozinha."""
+    if (S.get("auto_pause", True) and it["status"] == "lendo" and it.get("ongoing") and it.get("total")
+            and it["seen"] >= it["total"]):
+        it["status"], it["auto_paused"] = "pausado", True
+        add_event(it, "pause", "em dia com os lançamentos")
+        return True
+    return False
+
+
+def resume_if_new(it):
+    """Se a obra foi pausada automaticamente e saiu capítulo novo, volta para 'Lendo'."""
+    if not it.get("auto_paused"):
+        return False
+    if it["status"] != "pausado":
+        it["auto_paused"] = False                # o usuário já mudou o status: não mexe mais
+        return False
+    if it.get("ongoing") and it.get("total", 0) > it["seen"]:
+        it["status"], it["auto_paused"] = "lendo", False
+        add_event(it, "resume", "saiu capítulo novo")
+        return True
+    return False
 
 
 def add_event(it, kind, text=""):
@@ -764,17 +1068,16 @@ def label_color(app, name):
 def load_profile():
     p = dict(name="Leitor", handle="@leitor", bio="Clique em “Editar perfil” para contar quem você é.",
              avatar="", banner="")
-    try:
-        p.update(json.loads(profile_file().read_text(encoding="utf-8")))
-    except (OSError, ValueError):
-        pass
+    got = read_json(profile_file(), "perfil")
+    if isinstance(got, dict):
+        p.update(got)
     return p
 
 
 def save_profile(p):
     touch()
     data_dir().mkdir(parents=True, exist_ok=True)
-    profile_file().write_text(json.dumps(p, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_async(profile_file(), json.dumps(p, ensure_ascii=False, indent=2))
 
 
 def parse_date(s):
@@ -799,10 +1102,37 @@ def backup_members():
     return out
 
 
+_IMG_EXT = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+
+
 def make_backup(zip_path):
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+    """Zip com tudo. Imagens já vêm comprimidas, então entram sem recomprimir (bem mais rápido)."""
+    flush_saves()
+    zip_path = Path(zip_path)
+    tmp = zip_path.with_name(zip_path.name + ".part")
+    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as z:
         for src, name in backup_members():
-            z.write(src, name)
+            try:
+                z.write(src, name, compress_type=zipfile.ZIP_STORED if Path(src).suffix.lower() in _IMG_EXT
+                        else zipfile.ZIP_DEFLATED)
+            except OSError:
+                continue
+    tmp.replace(zip_path)
+
+
+def ensure_daily_backup():
+    """Um backup por dia, feito ao abrir o app (estado de ontem, antes de qualquer alteração de hoje)."""
+    try:
+        d = data_dir() / "backups"
+        d.mkdir(parents=True, exist_ok=True)
+        today = d / f"auto_{date.today():%Y-%m-%d}.zip"
+        if not today.exists() and data_file().exists():
+            make_backup(today)
+        for old in sorted(d.glob("auto_*.zip"))[:-7]:
+            old.unlink(missing_ok=True)
+        purge_old_trash()
+    except OSError:
+        pass
 
 
 # ---------- imagens ----------
@@ -851,7 +1181,7 @@ def placeholder(title):
             font = ImageFont.load_default()
         d.text((180, 250), ini, fill="white", font=font, anchor="mm")
     except Exception:
-        pass
+        log_error()
     return img
 
 
@@ -1117,7 +1447,7 @@ def banner_pil(path, w, h, bg, accent, fade=(0.18, 0.42)):
     base = None
     try:
         if path and Path(path).exists():
-            base = ImageOps.fit(Image.open(path).convert("RGB"), (w, h))
+            base = ImageOps.fit(Image.open(path).convert("RGB"), (w, h), Image.LANCZOS)
     except OSError:
         base = None
     if base is None:
@@ -1134,13 +1464,8 @@ def banner_pil(path, w, h, bg, accent, fade=(0.18, 0.42)):
     return Image.composite(Image.new("RGB", (w, h), bg), base, mask)
 
 
-def banner_img(path, w, h, bg, accent):
-    w = max(300, int(w))
-    img = banner_pil(path, int(w * ss()), int(h * ss()), bg, accent)
-    return ctk.CTkImage(img, size=(w, h))
-
-
-TIER_COLOR = {"bronze": "#cd7f32", "prata": "#c3cad9", "ouro": "#ffc233"}
+TIER_COLOR = {"bronze": "#cd7f32", "prata": "#c3cad9", "ouro": "#ffc233", "platina": "#6fe7ff"}
+PLAT_STOPS = ["#7df3ff", "#6aa5ff", "#b58cff", "#ff9be6", "#8cf6ff"]      # reflexo holográfico da platina
 
 
 _BADGE_CACHE = {}
@@ -1165,7 +1490,15 @@ def badge_pil(ic, tier, earned, size=56, prog=None):
     R = s / 2 - s * 0.05
     mask = Image.new("L", (s, s), 0)
     md = ImageDraw.Draw(mask)
-    if tier == "ouro" and earned:
+    plat = tier == "platina" and earned
+    if plat:                                                                # borda em estrela de 8 pontas
+        pts = []
+        for k in range(240):
+            a_ = k * 2 * math.pi / 240
+            r = R * (0.84 + 0.16 * abs(math.cos(4 * a_)) ** 2.4)
+            pts.append((cx + r * math.cos(a_), cy + r * math.sin(a_)))
+        md.polygon(pts, fill=255)
+    elif tier == "ouro" and earned:
         pts = []
         for k in range(180):
             a_ = k * 2 * math.pi / 180
@@ -1176,6 +1509,21 @@ def badge_pil(ic, tier, earned, size=56, prog=None):
         md.ellipse([cx - R, cy - R, cx + R, cy + R], fill=255)
     grad = ImageOps.flip(Image.linear_gradient("L").resize((s, s)))
     ring = ImageOps.colorize(grad, dark, light).convert("RGBA")
+    if plat:                                                                # degradê cônico: ciano → azul → violeta → rosa
+        ring = Image.new("RGBA", (s, s), (0, 0, 0, 255))
+        rd_ = ImageDraw.Draw(ring)
+        for deg in range(360):
+            t_ = deg / 360 * (len(PLAT_STOPS) - 1)
+            i_ = int(t_)
+            col_ = mix(PLAT_STOPS[i_], PLAT_STOPS[min(i_ + 1, len(PLAT_STOPS) - 1)], t_ - i_)
+            rd_.pieslice([0, 0, s - 1, s - 1], deg - 91, deg - 89, fill=col_)
+        hi_ = Image.new("RGBA", (s, s), (255, 255, 255, 0))
+        hi_.putalpha(grad.point(lambda v: int(v * .45)))
+        lo_ = Image.new("RGBA", (s, s), (0, 0, 40, 0))
+        lo_.putalpha(grad.point(lambda v: int((255 - v) * .40)))
+        ring.alpha_composite(hi_)
+        ring.alpha_composite(lo_)
+        core = "#0a1630"
     im = Image.new("RGBA", (s, s), (0, 0, 0, 0))
     im.paste(ring, (0, 0), mask)
     d = ImageDraw.Draw(im)
@@ -1201,6 +1549,15 @@ def badge_pil(ic, tier, earned, size=56, prog=None):
     if prog is not None and not earned and prog > 0:
         d.arc([cx - R * .90, cy - R * .90, cx + R * .90, cy + R * .90], -90, -90 + 360 * min(1.0, prog),
               fill=P["accent"], width=max(4, int(s * 0.065)))
+    if plat:                                                                # anel fino brilhante + faíscas nos cantos
+        d = ImageDraw.Draw(im)
+        r3 = r2 * 0.90
+        d.ellipse([cx - r3, cy - r3, cx + r3, cy + r3], outline=(160, 245, 255, 170), width=max(2, int(s * 0.010)))
+        for fx, fy, fr in ((0.86, 0.14, 0.11), (0.14, 0.84, 0.085), (0.90, 0.80, 0.055)):
+            sx, sy, sr = s * fx, s * fy, s * fr
+            d.polygon([(sx, sy - sr), (sx + sr * .24, sy - sr * .24), (sx + sr, sy), (sx + sr * .24, sy + sr * .24),
+                       (sx, sy + sr), (sx - sr * .24, sy + sr * .24), (sx - sr, sy), (sx - sr * .24, sy - sr * .24)],
+                      fill=(235, 252, 255, 255))
     g = int(size * 0.46)
     glyph = icon_pil(ic, g, "#ffffff")
     gw = glyph.size[0]
@@ -1446,6 +1803,11 @@ def make_share_image(app, path):
     d.rounded_rectangle([X, ly, X + lwid + 82, ly + 48], radius=24, fill=mix(tcol_, navy, .82), outline=tcol_, width=2)
     put(ico("crown", 28, tcol_), (X + 16, ly + 10))
     T((X + 54, ly + 24), lab_lv, 26, tcol_, True, "lm")
+    if title_is_plat(app):
+        for fx, fy, fr in ((X + lwid + 82 - 6, ly - 4, 13), (X + 10, ly + 52, 9), (X + lwid + 82 + 12, ly + 36, 7)):
+            sparkle(d, fx, fy, fr, "#eaffff")
+        d.rounded_rectangle([X - 4, ly - 4, X + lwid + 86, ly + 52], radius=28, outline=mix(tcol_, "#ffffff", .35),
+                            width=1)
     bio = (pr.get("bio") or "").strip()
     if bio and not bio.startswith("Clique em"):
         for k, line in enumerate(_wrap(d, bio, get_font(28), maxw, 2)):
@@ -1565,10 +1927,180 @@ def entry(parent, ph="", **kw):
     return e
 
 
+def _app_is_active(app):
+    """True se a janela em primeiro plano é o app (ou uma janelinha dele). Fora do Windows, sempre True."""
+    try:
+        import ctypes
+        u = ctypes.windll.user32
+        fg = u.GetForegroundWindow()
+        if not fg:
+            return False
+        me = u.GetAncestor(app.winfo_id(), 2) or app.winfo_id()          # janela raiz do app
+        return u.GetAncestor(fg, 3) == me or fg == me                   # GA_ROOTOWNER: dono da janelinha
+    except Exception:
+        return True
+
+
+def list_popup(app, x, y, w, values, current, on_pick, marks=False, max_rows=9, above_y=None, title=None):
+    """Lista suspensa com altura limitada e barra de rolagem fina (para muitos itens). Fecha com Esc ou clique fora."""
+    top = tk.Toplevel(app)
+    top.withdraw()
+    top.overrideredirect(True)
+    top.configure(bg=P["border"])
+    try:
+        top.transient(app)                   # fica só por cima do app (não por cima de outros programas)
+    except tk.TclError:
+        pass
+    box = tk.Frame(top, bg=P["surface"])
+    box.pack(fill="both", expand=True, padx=1, pady=1)
+    if title:
+        tk.Label(box, text=title, anchor="w", bg=P["surface"], fg=P["muted"], font=("TkDefaultFont", fpt(10), "bold"),
+                 padx=px(14), pady=px(7)).pack(fill="x")
+    cv = tk.Canvas(box, bg=P["surface"], highlightthickness=0, bd=0)
+    sb = tk.Canvas(box, width=px(10), bg=P["surface"], highlightthickness=0, bd=0)
+    inner = tk.Frame(cv, bg=P["surface"])
+    cv.create_window(0, 0, window=inner, anchor="nw", tags="in")
+    fnt = ("TkDefaultFont", fpt(11))
+    hov, nrm = mix(P["surface"], P["accent"], .22), P["surface"]
+    sel_bg = mix(P["surface"], P["accent"], .38)
+    rows = []
+
+    fid = [None]
+
+    def close(v=None, picked=False):
+        if fid[0] is not None:
+            try:
+                app.unbind("<Configure>", fid[0])
+            except tk.TclError:
+                pass
+            fid[0] = None
+        try:
+            top.grab_release()
+            top.destroy()
+        except tk.TclError:
+            return
+        if picked:
+            app.after(10, lambda: on_pick(v))
+
+    for v in values:
+        on = v == current
+        txt = (("✓  " if on else "      ") if marks else "") + v
+        lb = tk.Label(inner, text=txt, anchor="w", bg=sel_bg if on else nrm, fg=P["text"], font=fnt,
+                      padx=px(14), pady=px(7), cursor="hand2")
+        lb.pack(fill="x")
+        lb.bind("<Enter>", lambda e, lb=lb: lb.configure(bg=hov))
+        lb.bind("<Leave>", lambda e, lb=lb, on=on: lb.configure(bg=sel_bg if on else nrm))
+        lb.bind("<Button-1>", lambda e, v=v: close(v, True))
+        rows.append(lb)
+    top.update_idletasks()
+    rh = max(1, rows[0].winfo_reqheight()) if rows else px(30)
+    n = len(values)
+    vis = min(n, max_rows)
+    H = vis * rh
+    cv.configure(height=H, yscrollincrement=rh, scrollregion=(0, 0, 1, n * rh))
+    st = {"lo": 0.0, "hi": 1.0}
+
+    def draw_sb(lo, hi):
+        lo, hi = float(lo), float(hi)                           # o Tk entrega textos ("0.0", "0.4")
+        st["lo"], st["hi"] = lo, hi
+        sb.delete("all")
+        Hs = sb.winfo_height()
+        if hi - lo >= 0.999 or Hs < 10:
+            return
+        sb.create_line(px(5), px(3), px(5), Hs - px(3), fill=P["surface2"], width=max(2, px(2)), capstyle="round")
+        y0, y1 = lo * Hs, max(hi * Hs, lo * Hs + px(24))
+        sb.create_line(px(5), y0 + px(3), px(5), y1 - px(3), fill=P["muted"], width=px(5), capstyle="round")
+
+    def sb_drag(e):
+        Hs = max(1, sb.winfo_height())
+        span = st["hi"] - st["lo"]
+        cv.yview_moveto(max(0.0, min(1.0 - span, e.y / Hs - span / 2)))
+    cv.configure(yscrollcommand=draw_sb)
+    sb.bind("<Configure>", lambda e: draw_sb(*cv.yview()))
+    sb.bind("<ButtonPress-1>", sb_drag)
+    sb.bind("<B1-Motion>", sb_drag)
+    if n > vis:
+        sb.pack(side="right", fill="y", padx=(0, px(3)), pady=px(3))
+    cv.pack(side="left", fill="both", expand=True)
+    cv.bind("<Configure>", lambda e: cv.itemconfigure("in", width=e.width))
+
+    def wheel(e):
+        cv.yview_scroll((-1 if (getattr(e, "delta", 0) > 0 or getattr(e, "num", 0) == 4) else 1) * 2, "units")
+    for wd in [top, box, cv, inner, sb] + rows:
+        wd.bind("<MouseWheel>", wheel)
+        wd.bind("<Button-4>", wheel)
+        wd.bind("<Button-5>", wheel)
+    Wp = max(w, px(200))
+    Hp = H + 4 + (px(32) if title else 0)
+    sh, sw = app.winfo_screenheight(), app.winfo_screenwidth()
+    if y + Hp > sh - px(48):                                    # sem espaço embaixo: abre para cima
+        y = max(4, (above_y if above_y is not None else y) - Hp - px(2))
+    x = max(0, min(x, sw - Wp - 8))
+    top.geometry(f"{Wp}x{Hp}+{int(x)}+{int(y)}")
+    if current in values and n > vis:
+        first = max(0, min(values.index(current) - 1, n - vis))
+        cv.yview_moveto(first * rh / (n * rh))
+    top.deiconify()
+    top.lift()
+
+    def outside(e):
+        if not (top.winfo_rootx() <= e.x_root <= top.winfo_rootx() + top.winfo_width()
+                and top.winfo_rooty() <= e.y_root <= top.winfo_rooty() + top.winfo_height()):
+            close()
+    top.bind("<Button-1>", outside, add="+")
+    top.bind("<Escape>", lambda e: close())
+
+    miss = [0]
+
+    def watch():                             # fecha se o app perder o foco, for minimizado ou mudar de lugar
+        try:
+            if not top.winfo_exists():
+                return
+            if app.state() in ("iconic", "withdrawn"):          # (maximizado = "zoomed": não é motivo para fechar)
+                return close()
+            miss[0] = 0 if _app_is_active(app) else miss[0] + 1
+            if miss[0] >= 2:                                    # só fecha se ficar fora do app por um tempinho
+                return close()
+            top.after(250, watch)
+        except tk.TclError:
+            pass
+    top.after(400, watch)
+    geo0 = (app.winfo_rootx(), app.winfo_rooty(), app.winfo_width(), app.winfo_height())
+
+    def moved(e):                            # só fecha se a janela do app mudou de lugar ou de tamanho
+        try:
+            if e.widget is app and (app.winfo_rootx(), app.winfo_rooty(), app.winfo_width(), app.winfo_height()) != geo0:
+                close()
+        except tk.TclError:
+            pass
+    fid[0] = app.bind("<Configure>", moved, add="+")
+    try:
+        top.focus_force()
+        top.grab_set()
+    except tk.TclError:
+        pass
+    return top
+
+
+class ScrollOptionMenu(ctk.CTkOptionMenu):
+    """Menu suspenso que, com muitas opções, abre uma lista com altura limitada e barra de rolagem."""
+    MAX_ROWS = 9
+
+    def _open_dropdown_menu(self):
+        vals = list(getattr(self, "_values", None) or [])
+        if len(vals) <= self.MAX_ROWS:
+            return super()._open_dropdown_menu()
+        try:
+            list_popup(self.winfo_toplevel(), self.winfo_rootx(), self.winfo_rooty() + self.winfo_height() + px(2),
+                       self.winfo_width(), vals, self.get(), self._dropdown_callback, above_y=self.winfo_rooty())
+        except Exception:
+            super()._open_dropdown_menu()
+
+
 def menu(parent, values, command=None, width=140, fg=None, **kw):
     kw.setdefault("corner_radius", 10)
     kw.setdefault("dynamic_resizing", False)
-    return ctk.CTkOptionMenu(parent, values=values, command=command, width=width,
+    return ScrollOptionMenu(parent, values=values, command=command, width=width,
                              fg_color=fg or P["surface"], button_color=P["surface2"],
                              button_hover_color=P["accent"], text_color=P["text"],
                              dropdown_fg_color=P["surface"], dropdown_text_color=P["text"],
@@ -1729,13 +2261,13 @@ class Tip:
             try:
                 self.w.after_cancel(self.job)
             except Exception:
-                pass
+                log_error()
             self.job = None
         if self.tw is not None:
             try:
                 self.tw.destroy()
             except Exception:
-                pass
+                log_error()
             self.tw = None
 
 
@@ -1897,7 +2429,7 @@ class ScrollFrame(tk.Frame):
         try:
             self._outer.destroy()
         except Exception:
-            pass
+            log_error()
 
 
 class HShelf(ctk.CTkFrame):
@@ -1967,13 +2499,13 @@ def preview_hide():
         try:
             root.after_cancel(PV["job"])
         except Exception:
-            pass
+            log_error()
     PV["job"] = None
     if PV["tw"] is not None:
         try:
             PV["tw"].destroy()
         except Exception:
-            pass
+            log_error()
         PV["tw"] = None
 
 
@@ -1991,7 +2523,7 @@ def preview_show(app, it):
         try:
             tw.wm_attributes("-topmost", True)
         except Exception:
-            pass
+            log_error()
         outer = tk.Frame(tw, bg=app.item_color(it), padx=1, pady=1)
         outer.pack()
         body = tk.Frame(outer, bg=P["surface"], padx=px(12), pady=px(10))
@@ -2014,7 +2546,7 @@ def preview_show(app, it):
             line(it["notes"][:150] + ("…" if len(it["notes"]) > 150 else ""), 10, pad=6)
         if it["quotes"]:
             q = max(it["quotes"], key=lambda q: q.get("ts", 0))
-            line(f"“{q['text'][:110]}”  — cap. {q.get('ch', 0)}", 9, fg=P["muted"], pad=6)
+            line(f"“{q['text'][:260]}{'…' if len(q['text']) > 260 else ''}”  — cap. {q.get('ch', 0)}", 9, fg=P["muted"], pad=6)
         tw.update_idletasks()
         w, h = tw.winfo_reqwidth(), tw.winfo_reqheight()
         x = min(app.winfo_pointerx() + 18, app.winfo_screenwidth() - w - 8)
@@ -2034,7 +2566,7 @@ def shelf_tip_show(app, it):
         try:
             tw.wm_attributes("-topmost", True)
         except Exception:
-            pass
+            log_error()
         col = app.item_color(it)
         outer = tk.Frame(tw, bg=col, padx=1, pady=1)
         outer.pack()
@@ -2047,7 +2579,7 @@ def shelf_tip_show(app, it):
             lb.image = ph
             lb.pack(side="left", anchor="n", padx=(0, px(10)))
         except Exception:
-            pass
+            log_error()
         right = tk.Frame(body, bg=P["surface"])
         right.pack(side="left", anchor="n")
         tk.Label(right, text=it["title"], bg=P["surface"], fg=P["text"], justify="left", anchor="w",
@@ -2118,25 +2650,6 @@ def attach_preview(app, widget, it):
 
 
 # ---- animações sutis (podem ser desligadas em Configurações) ----
-def animate_number(lbl, target, fmt=None, steps=14):
-    """Número que 'conta' até o valor final."""
-    fmt = fmt or (lambda v: f"{int(round(v))}")
-    if (not S.get("anim", True)) or isinstance(target, bool) or not isinstance(target, (int, float)) or target < 2:
-        return
-
-    def step(i=1):
-        try:
-            if not lbl.winfo_exists():
-                return
-            t = 1 - (1 - i / steps) ** 3
-            lbl.configure(text=fmt(target * t) if i < steps else fmt(target))
-            if i < steps:
-                lbl.after(26, lambda: step(i + 1))
-        except tk.TclError:
-            pass
-
-    lbl.configure(text=fmt(0))
-    lbl.after(30, step)
 
 
 def animate_bar(bar, target, steps=16):
@@ -2185,7 +2698,7 @@ def show_splash(root):
         try:
             sp.wm_attributes("-topmost", True)
         except Exception:
-            pass
+            log_error()
         sp.update()
         return sp
     except Exception:
@@ -2197,10 +2710,14 @@ def splash_step(sp, frac):
     if sp is None:
         return
     try:
+        if not sp.winfo_exists():
+            return
         sp._bar.place_configure(relwidth=max(0.08, min(1.0, frac)))
         sp.update()
+    except tk.TclError:
+        pass                                    # a abertura já foi fechada: normal
     except Exception:
-        pass
+        log_error()
 
 
 def new_scroll(master):
@@ -2314,95 +2831,6 @@ class StarRating(tk.Canvas):
 
 
 # ---------- gráficos ----------
-def _canvas(parent, height):
-    return tk.Canvas(parent, width=10, height=height, bg=P["surface"], highlightthickness=0, bd=0)
-
-
-def bars(parent, data, height=150, colors=None):
-    height = px(height)
-    k = scale_k()
-    c = _canvas(parent, height)
-    fs = ("TkDefaultFont", fpt(9))
-
-    def draw(width):
-        c.delete("all")
-        mx = max([v for _, v in data] + [1])
-        bw = max(1, width) / len(data)
-        y1 = height - 20 * k
-        for i, (lab, v) in enumerate(data):
-            x0, x1 = i * bw + 5 * k, (i + 1) * bw - 5 * k
-            h = (height - 46 * k) * v / mx
-            col = colors[i] if colors else P["accent"]
-            if v:
-                top = y1 - h
-                c.create_rectangle(x0, top, x1, y1, fill=col, width=0)
-                c.create_text((x0 + x1) / 2, top - 9 * k, text=f"{v:g}", fill=P["text"], font=fs)
-            else:
-                c.create_line(x0, y1, x1, y1, fill=P["border"], width=max(1, int(2 * k)))
-            c.create_text((x0 + x1) / 2, y1 + 10 * k, text=lab, fill=P["muted"], font=fs)
-
-    c.bind("<Configure>", lambda e: draw(e.width))
-    return c
-
-
-def hist(parent, counts, height=110):
-    """Histograma de notas (0,5 a 5 estrelas)."""
-    height = px(height)
-    k = scale_k()
-    c = _canvas(parent, height)
-    fs = ("TkDefaultFont", fpt(9))
-
-    def draw(W):
-        c.delete("all")
-        mx = max(counts + [1])
-        bw = max(1, W) / len(counts)
-        base = height - 24 * k
-        for i, v in enumerate(counts):
-            x0, x1 = i * bw + 3 * k, (i + 1) * bw - 3 * k
-            if v:
-                top = base - (base - 8 * k) * v / mx
-                c.create_rectangle(x0, top, x1, base, fill=P["accent"], width=0)
-            else:
-                c.create_line(x0, base, x1, base, fill=P["border"], width=max(1, int(2 * k)))
-        c.create_text(4 * k, height - 9 * k, text="0,5 ★", anchor="w", fill=P["muted"], font=fs)
-        c.create_text(W - 4 * k, height - 9 * k, text="5 ★", anchor="e", fill=P["muted"], font=fs)
-
-    c.bind("<Configure>", lambda e: draw(e.width))
-    return c
-
-
-def radar(parent, labels, values, height=250):
-    """Gráfico radar (teia) com valores de 0 a 1."""
-    height = px(height)
-    k = scale_k()
-    c = _canvas(parent, height)
-    n = len(labels)
-    ang = [-math.pi / 2 + i * 2 * math.pi / n for i in range(n)]
-    fs = ("TkDefaultFont", fpt(10))
-
-    def draw(W, H):
-        c.delete("all")
-        cx, cy = W / 2, H / 2
-        R = max(30 * k, min(W / 2 - 78 * k, H / 2 - 28 * k))
-        for lvl in (1, .66, .33):
-            pts = [v for a in ang for v in (cx + R * lvl * math.cos(a), cy + R * lvl * math.sin(a))]
-            c.create_polygon(*pts, outline=P["border"], fill="", width=1)
-        for a in ang:
-            c.create_line(cx, cy, cx + R * math.cos(a), cy + R * math.sin(a), fill=P["border"])
-        pts = [(cx + R * max(.14, v) * math.cos(a), cy + R * max(.14, v) * math.sin(a)) for v, a in zip(values, ang)]
-        c.create_polygon(*[v for p in pts for v in p], fill=mix(P["accent"], P["surface"], .62),
-                         outline=P["accent"], width=max(1, int(2 * k)))
-        for x, y in pts:
-            c.create_oval(x - 4 * k, y - 4 * k, x + 4 * k, y + 4 * k, fill=P["accent"], outline=P["accent"])
-        for lab, a in zip(labels, ang):
-            cs, sn = math.cos(a), math.sin(a)
-            ax = "w" if cs > .3 else "e" if cs < -.3 else ""
-            ay = "s" if sn < -.3 else "n" if sn > .3 else ""
-            c.create_text(cx + (R + 12 * k) * cs, cy + (R + 12 * k) * sn, text=lab[:14],
-                          anchor=(ay + ax) or "center", fill=P["muted"], font=fs)
-
-    c.bind("<Configure>", lambda e: draw(e.width, e.height))
-    return c
 
 
 def smooth_pts(pts, steps=10):
@@ -2415,79 +2843,6 @@ def smooth_pts(pts, steps=10):
             out.append((x0 + (x1 - x0) * t, y0 * (1 - m) + y1 * m))
     out.append(pts[-1])
     return out
-
-
-def linechart(parent, data, height=170):
-    """Linha suave com área preenchida (ex.: capítulos por mês)."""
-    height = px(height)
-    k = scale_k()
-    c = _canvas(parent, height)
-    fs = ("TkDefaultFont", fpt(9))
-
-    def draw(W):
-        c.delete("all")
-        n = len(data)
-        if n < 2:
-            return
-        left, right, top, base = 16 * k, 16 * k, 22 * k, height - 24 * k
-        mx = max([v for _, v in data] + [1])
-        step = (W - left - right) / (n - 1)
-        pts = [(left + i * step, base - (base - top) * v / mx) for i, (_, v) in enumerate(data)]
-        sm = smooth_pts(pts)
-        area = [(pts[0][0], base)] + sm + [(pts[-1][0], base)]
-        c.create_polygon(*[v for p in area for v in p], fill=mix(P["accent"], P["surface"], .82), outline="")
-        c.create_line(left, base, W - right, base, fill=P["border"])
-        c.create_line(*[v for p in sm for v in p], fill=P["accent"], width=max(2, int(3 * k)),
-                      capstyle="round", joinstyle="round")
-        for i, ((lab, v), (x, y)) in enumerate(zip(data, pts)):
-            c.create_oval(x - 4 * k, y - 4 * k, x + 4 * k, y + 4 * k, fill=P["surface"], outline=P["accent"],
-                          width=max(2, int(2 * k)))
-            c.create_text(x, base + 12 * k, text=lab, fill=P["muted"], font=fs)
-            if v and v == mx:
-                c.create_text(x, y - 13 * k, text=f"{v:g}", fill=P["text"], font=fs)
-
-    c.bind("<Configure>", lambda e: draw(e.width))
-    return c
-
-
-def donut(parent, data, height=190, center="leituras"):
-    """Gráfico de rosca. data = [(rótulo, valor, cor)]"""
-    height = px(height)
-    k = scale_k()
-    c = _canvas(parent, height)
-    fs = ("TkDefaultFont", fpt(10))
-    fb = ("TkDefaultFont", fpt(20), "bold")
-
-    def draw(W, H):
-        c.delete("all")
-        total = sum(v for _, v, _ in data)
-        size = min(H - 16 * k, W * 0.46)
-        cx, cy = 20 * k + size / 2, H / 2
-        th = size * 0.17
-        box = (cx - size / 2 + th / 2, cy - size / 2 + th / 2, cx + size / 2 - th / 2, cy + size / 2 - th / 2)
-        if total <= 0:
-            c.create_arc(*box, start=90, extent=359.9, style="arc", outline=P["surface2"], width=th)
-        else:
-            start = 90.0
-            for lab, v, col in data:
-                if v <= 0:
-                    continue
-                ext = -360.0 * v / total
-                c.create_arc(*box, start=start, extent=ext + min(2.0, abs(ext) / 4), style="arc", outline=col,
-                             width=th)
-                start += ext
-        c.create_text(cx, cy - 8 * k, text=str(total), fill=P["text"], font=fb)
-        c.create_text(cx, cy + 14 * k, text=center, fill=P["muted"], font=fs)
-        lx = cx + size / 2 + 30 * k
-        y = max(16 * k, cy - len(data) * 13 * k + 13 * k)
-        for lab, v, col in data:
-            c.create_oval(lx, y - 6 * k, lx + 12 * k, y + 6 * k, fill=col, outline="")
-            c.create_text(lx + 20 * k, y, text=lab, anchor="w", fill=P["text"], font=fs)
-            c.create_text(W - 16 * k, y, text=str(v), anchor="e", fill=P["muted"], font=fs)
-            y += 26 * k
-
-    c.bind("<Configure>", lambda e: draw(e.width, e.height))
-    return c
 
 
 def panel(parent, title):
@@ -2503,258 +2858,9 @@ def year_of(s):
     return d.year if d else None
 
 
-def panel_year(parent, app):
-    year = date.today().year
-    items, act = app.items, app.activity
-    added = sum(1 for i in items if i["created"] and datetime.fromtimestamp(i["created"]).year == year)
-    started = sum(1 for i in items if year_of(i["started"]) == year)
-    done = sum(1 for i in items if i["status"] == "completo" and year_of(i["finished"]) == year)
-    f, _ = panel(parent, str(year))
-    g = ctk.CTkFrame(f, fg_color="transparent")
-    g.pack(fill="x", padx=12)
-    cells = [("book", added, "Adicionadas"), ("play", started, "Iniciadas"),
-             ("check", done, "Completas"), ("flag", f"{done}/{S['goal']}", "Meta do ano"),
-             ("chart", sum_activity(act, str(year), "ch"), "Capítulos lidos"),
-             ("clock", fmt_minutes(sum_activity(act, str(year), "min")), "Tempo de leitura")]
-    for k, (ic, val, lab) in enumerate(cells):
-        c = ctk.CTkFrame(g, fg_color="transparent")
-        c.grid(row=k // 2, column=k % 2, sticky="w", padx=6, pady=8)
-        ctk.CTkLabel(c, text="", image=icon(ic, 20), width=26).pack(side="left", anchor="n", padx=(0, 8))
-        t = ctk.CTkFrame(c, fg_color="transparent")
-        t.pack(side="left")
-        nl = ctk.CTkLabel(t, text=str(val), text_color=P["text"], font=ctk.CTkFont(size=18, weight="bold"),
-                          anchor="w")
-        nl.pack(anchor="w")
-        animate_number(nl, val)
-        ctk.CTkLabel(t, text=lab, text_color=P["muted"], font=ctk.CTkFont(size=12), anchor="w").pack(anchor="w")
-    g.grid_columnconfigure((0, 1), weight=1)
-    ctk.CTkButton(f, text="Ver biblioteca", image=icon("chevron", 16, P["accent"]), compound="right",
-                  fg_color="transparent", hover_color=P["surface2"], text_color=P["accent"], anchor="w",
-                  command=lambda: app.nav("library")).pack(fill="x", padx=12, pady=(2, 12))
-    return f
-
-
-def panel_ratings(parent, items):
-    rated = [i["rating"] for i in items if i["rating"]]
-    f, head = panel(parent, "Avaliações")
-    if rated:
-        ctk.CTkLabel(head, text=f"({len(rated)})", text_color=P["muted"], font=ctk.CTkFont(size=11)).pack(side="right")
-        ctk.CTkLabel(head, text=f"★ {sum(rated) / len(rated):.1f}".replace(".", ","), text_color=GOLD_HEX,
-                     font=ctk.CTkFont(size=15, weight="bold")).pack(side="right", padx=6)
-    hist(f, [sum(1 for i in items if i["rating"] == (k + 1) / 2) for k in range(10)]).pack(
-        fill="x", padx=16, pady=(0, 14))
-    return f
-
-
-def panel_genres(parent, items):
-    top = Counter(t for i in items for t in i["tags"]).most_common(5)
-    f, _ = panel(parent, "Principais gêneros")
-    if len(top) < 3:
-        ctk.CTkLabel(f, text="Cadastre pelo menos 3 gêneros diferentes nas suas leituras para ver este gráfico.",
-                     text_color=P["muted"], wraplength=280, justify="left").pack(anchor="w", padx=16, pady=(0, 18))
-    else:
-        mx = top[0][1]
-        radar(f, [t for t, _ in top], [n / mx for _, n in top]).pack(fill="x", padx=10, pady=(0, 10))
-    return f
-
-
-def panel_types(parent, items):
-    f, _ = panel(parent, "Por tipo")
-    bars(f, [(t, sum(1 for i in items if i["type"] == t)) for t in TYPES],
-         colors=[type_color(t) for t in TYPES]).pack(fill="x", padx=16, pady=(0, 14))
-    return f
-
-
-def panel_status(parent, items):
-    f, _ = panel(parent, "Por status")
-    donut(f, [(STATUS[k], sum(1 for i in items if i["status"] == k), P["status"][k]) for k in STATUS]).pack(
-        fill="x", padx=16, pady=(0, 14))
-    return f
-
-
-def panel_chapters_month(parent, app):
-    f, _ = panel(parent, "Capítulos por mês")
-    today = date.today()
-    data = []
-    for back in range(11, -1, -1):
-        mm, yy = today.month - back, today.year
-        while mm <= 0:
-            mm += 12
-            yy -= 1
-        data.append((MESES[mm - 1], sum_activity(app.activity, f"{yy:04d}-{mm:02d}", "ch")))
-    linechart(f, data).pack(fill="x", padx=16, pady=(0, 14))
-    return f
-
-
-def panel_months(parent, items):
-    year = date.today().year
-    f, _ = panel(parent, f"Completas por mês em {year}")
-    mes = ["J", "F", "M", "A", "M", "J", "J", "A", "S", "O", "N", "D"]
-    done = [parse_date(i["finished"]) for i in items if i["status"] == "completo"]
-    bars(f, [(m, sum(1 for d in done if d and d.year == year and d.month == n + 1))
-             for n, m in enumerate(mes)]).pack(fill="x", padx=16, pady=(0, 6))
-    ctk.CTkLabel(f, text="Só entram leituras com data de fim preenchida.", text_color=P["muted"],
-                 font=ctk.CTkFont(size=11)).pack(anchor="w", padx=16, pady=(0, 12))
-    return f
-
-
-def panel_goal(parent, app):
-    year = date.today().year
-    n = sum(1 for i in app.items if i["status"] == "completo" and year_of(i["finished"]) == year)
-    f, _ = panel(parent, f"Meta de {year}")
-    lbl = ctk.CTkLabel(f, text="", text_color=P["muted"])
-    lbl.pack(anchor="w", padx=16)
-    bar = ctk.CTkProgressBar(f, height=10, fg_color=P["surface2"], progress_color=P["accent"])
-    bar.pack(fill="x", padx=16, pady=8)
-    g = ctk.CTkFrame(f, fg_color="transparent")
-    g.pack(fill="x", padx=16, pady=(0, 14))
-    ctk.CTkLabel(g, text="Meta:", text_color=P["muted"]).pack(side="left")
-    ent = entry(g, width=64)
-    ent.insert(0, str(S["goal"]))
-    ent.pack(side="left", padx=8)
-
-    def show():
-        lbl.configure(text=f"{n} de {S['goal']} leituras completas este ano")
-        animate_bar(bar, min(1, n / max(1, S["goal"])))
-
-    def setgoal():
-        try:
-            S["goal"] = max(1, int(ent.get()))
-        except ValueError:
-            return
-        save_settings()
-        touch()
-        show()
-
-    accent_button(g, "Salvar", setgoal, width=80).pack(side="left")
-    show()
-    return f
-
-
 MESES = ["jan", "fev", "mar", "abr", "mai", "jun", "jul", "ago", "set", "out", "nov", "dez"]
 MESES_LONGOS = ["janeiro", "fevereiro", "março", "abril", "maio", "junho", "julho", "agosto", "setembro",
                 "outubro", "novembro", "dezembro"]
-
-
-def stat_strip(parent, items, act=None):
-    f = ctk.CTkFrame(parent, fg_color=P["surface"], corner_radius=14, border_width=1, border_color=P["border"])
-    rated = [i["rating"] for i in items if i["rating"]]
-    cells = [("Leituras", len(items)), ("Lendo", sum(1 for i in items if i["status"] == "lendo")),
-             ("Completas", sum(1 for i in items if i["status"] == "completo")),
-             ("Favoritas", sum(1 for i in items if i["favorite"])),
-             ("Capítulos lidos", sum(i["seen"] for i in items)),
-             ("Nota média", f"{sum(rated) / len(rated):.1f}".replace(".", ",") if rated else "–")]
-    if act is not None:
-        cells.append(("Tempo lido", fmt_minutes(sum_activity(act, "", "min"))))
-    boxes = []
-    for lab, val in cells:
-        b = ctk.CTkFrame(f, fg_color="transparent")
-        nl = ctk.CTkLabel(b, text=str(val), text_color=P["text"], font=ctk.CTkFont(size=20, weight="bold"))
-        nl.pack()
-        animate_number(nl, val)
-        ctk.CTkLabel(b, text=lab, text_color=P["muted"], font=ctk.CTkFont(size=11)).pack()
-        boxes.append(b)
-
-    def relay(e):
-        n = balanced_cols(len(boxes), lw(e.width))
-        for k, b in enumerate(boxes):
-            b.grid_forget()
-            b.grid(row=k // n, column=k % n, sticky="ew", padx=6, pady=10)
-        for c in range(8):
-            f.grid_columnconfigure(c, weight=1 if c < n else 0)
-
-    f.bind("<Configure>", relay)
-    return f
-
-
-def heatmap(parent, act):
-    """Calendário de atividade (um quadradinho por dia, estilo GitHub), ajustado à largura do cartão."""
-    k = scale_k()
-    gap = px(3)
-    c = _canvas(parent, int(7 * (px(18) + gap) + 30 * k))
-    fs = ("TkDefaultFont", fpt(9))
-
-    def draw(W):
-        c.delete("all")
-        avail = max(60.0, W - 8 * k)
-        weeks = 53
-        cell = avail / weeks - gap
-        if cell < px(9):
-            cell = px(9)
-            weeks = max(8, int(avail // (cell + gap)))
-        cell = min(cell, px(18))
-        c.configure(height=int(7 * (cell + gap) + 30 * k))
-        today = date.today()
-        start = today - timedelta(days=today.weekday() + 7 * (weeks - 1))
-        shades = [mix(P["surface2"], P["accent"], t) for t in (0, .3, .55, .8, 1)]
-        last_m = None
-        for w in range(weeks):
-            for d in range(7):
-                day = start + timedelta(days=7 * w + d)
-                if day > today:
-                    continue
-                e = act.get(day.isoformat(), {})
-                v = e.get("ch", 0) + e.get("min", 0) / 20
-                lv = 0 if v <= 0 else 1 if v < 3 else 2 if v < 6 else 3 if v < 10 else 4
-                x, y = 4 * k + w * (cell + gap), 22 * k + d * (cell + gap)
-                c.create_rectangle(x, y, x + cell, y + cell, fill=shades[lv], width=0)
-            m = (start + timedelta(days=7 * w)).month
-            if m != last_m:
-                c.create_text(4 * k + w * (cell + gap), 8 * k, text=MESES[m - 1], anchor="w", fill=P["muted"],
-                              font=fs)
-                last_m = m
-
-    c.bind("<Configure>", lambda e: draw(e.width))
-    return c
-
-
-def panel_activity(parent, app):
-    act = app.activity
-    cur, longest = streaks(act)
-    since = (date.today() - timedelta(days=29)).isoformat()
-    last30 = sum(v.get("ch", 0) for k, v in act.items() if k >= since)
-    f, _ = panel(parent, "Atividade de leitura")
-    row = ctk.CTkFrame(f, fg_color="transparent")
-    row.pack(fill="x", padx=12, pady=(0, 6))
-    for val, lab in ((f"{cur} dias", "Sequência atual"), (f"{longest} dias", "Maior sequência"),
-                     (str(last30), "Capítulos em 30 dias"), (fmt_minutes(sum_activity(act, "", "min")), "Tempo total")):
-        c = ctk.CTkFrame(row, fg_color="transparent")
-        c.pack(side="left", expand=True, padx=6)
-        ctk.CTkLabel(c, text=val, text_color=P["text"], font=ctk.CTkFont(size=20, weight="bold")).pack()
-        ctk.CTkLabel(c, text=lab, text_color=P["muted"], font=ctk.CTkFont(size=11)).pack()
-    heatmap(f, act).pack(fill="x", padx=16, pady=(4, 14))
-    return f
-
-
-def panel_recent(parent, app):
-    f, _ = panel(parent, "Capítulos nos últimos 14 dias")
-    today = date.today()
-    days = [today - timedelta(days=13 - k) for k in range(14)]
-    bars(f, [(str(d.day), app.activity.get(d.isoformat(), {}).get("ch", 0)) for d in days]).pack(
-        fill="x", padx=16, pady=(0, 14))
-    return f
-
-
-def panel_criteria(parent, items):
-    def avg(vals):
-        return round(sum(vals) / len(vals), 1) if vals else 0
-
-    f, _ = panel(parent, "Médias das suas notas")
-    data = [("História", avg([i["crit"].get("story", 0) for i in items if i["crit"].get("story")])),
-            ("Arte", avg([i["crit"].get("art", 0) for i in items if i["crit"].get("art")])),
-            ("Persona.", avg([i["crit"].get("chars", 0) for i in items if i["crit"].get("chars")])),
-            ("Geral", avg([i["rating"] for i in items if i["rating"]]))]
-    bars(f, data).pack(fill="x", padx=16, pady=(0, 14))
-    return f
-
-
-def panel_review(parent, app):
-    f, _ = panel(parent, "Retrospectiva do ano")
-    ctk.CTkLabel(f, text="Um resumo do que você leu: melhores leituras, gênero favorito, mês mais ativo e mais.",
-                 text_color=P["muted"], wraplength=300, justify="left").pack(anchor="w", padx=16)
-    accent_button(f, f"Ver retrospectiva de {date.today().year}", lambda: app.open_sub(YearReviewPage),
-                  height=34).pack(anchor="w", padx=16, pady=(10, 14))
-    return f
 
 
 # ---- conquistas ----
@@ -2791,7 +2897,7 @@ BADGES = [
     ("critico50", "Crítico veterano", "Dê nota a 50 leituras", "star", "ouro", "rated", 50),
     ("obraprima", "Obra-prima", "Dê nota 5 a 5 leituras", "gem", "prata", "rated5", 5),
     ("colecao200", "Biblioteca de volumes", "Marque 200 volumes como seus", "library", "ouro", "owned", 200),
-    ("semfronteiras", "Sem fronteiras", "Leia os 5 tipos de obra", "target", "ouro", "types", 5),
+    ("semfronteiras", "Sem fronteiras", "Leia 5 tipos diferentes de obra", "target", "ouro", "types", 5),
     ("favoritos20", "Muito amor", "Favorite 20 leituras", "heart", "prata", "favs", 20),
     ("estante100", "Estante cheia", "Tenha 100 leituras na lista", "library", "prata", "n_items", 100),
     ("estante250", "Acervo gigante", "Tenha 250 leituras na lista", "library", "ouro", "n_items", 250),
@@ -2854,6 +2960,39 @@ BADGES = [
     ("metadia100", "Meta inabalável", "Bata a meta diária de capítulos em 100 dias", "target", "ouro",
      "daily_hit", 100),
     ("listas10", "Curador de listas", "Use 10 listas diferentes", "list", "prata", "lists", 10),
+    # ---- novos tipos (Manhua e Novel) e títulos especiais ----
+    ("novel1", "Primeira novel", "Termine uma novel", "book", "bronze", "novel_done", 1),
+    ("manhua1", "Cultivador iniciante", "Termine um manhua", "flame", "bronze", "manhua_done", 1),
+    ("tipos3", "Encontro de tipos", "Leia 3 tipos diferentes de obra", "library", "bronze", "types", 3),
+    ("sextou", "Sextou com leitura", "Leia 10 capítulos numa sexta-feira", "sun", "bronze", "friday_max", 10),
+    ("estante50", "Primeiro castelo", "Tenha 50 leituras na lista", "library", "bronze", "n_items", 50),
+    ("anonimo", "Anônimo", "Termine 5 leituras sem dar nota", "check", "bronze", "done_unrated", 5),
+    ("manhwa10", "Lenda coreana", "Termine 10 manhwas", "trophy", "prata", "manhwa_done", 10),
+    ("manhua5", "Mestre da seita", "Termine 5 manhuas", "crown", "prata", "manhua_done", 5),
+    ("novel5", "Devorador de novels", "Termine 5 novels", "book", "prata", "novel_done", 5),
+    ("webtoon5", "Doce sonho", "Termine 5 webtoons", "play", "prata", "webtoon_done", 5),
+    ("pacto", "Pacto de cinco estrelas", "Dê nota 5 a 10 leituras", "star", "prata", "rated5", 10),
+    ("semremorso", "Sem remorso", "Abandone 10 leituras", "play", "prata", "dropped", 10),
+    ("fantasia10", "Reino da fantasia", "Termine 10 obras de fantasia", "gem", "prata", "fantasy_done", 10),
+    ("acao10", "Agente secreto", "Termine 10 obras de ação ou espionagem", "target", "prata", "action_done", 10),
+    ("listacheia", "Mesa completa", "Termine todas as obras de uma lista (mínimo de 5)", "list", "prata",
+     "list_done", 1),
+    ("pantano", "Pântano de leituras", "Tenha 10 leituras em andamento ao mesmo tempo", "list", "prata",
+     "n_reading", 10),
+    ("noites10", "Corte das corujas", "Leia de madrugada em 10 dias diferentes", "moon", "prata", "night_days", 10),
+    ("escala6x1", "Escala 6x1", "Leia 6 dias seguidos e descanse no 7º, 3 vezes", "clock", "prata", "six_one", 3),
+    ("hexagono", "Hexágono", "Leia 6 tipos diferentes de obra", "target", "ouro", "types", 6),
+    ("foradalei", "Fora da lei", "Abandone 25 leituras", "flame", "ouro", "dropped", 25),
+    ("mercenario", "Mercenário das longas", "Termine 15 obras com 100 ou mais capítulos", "trophy", "ouro",
+     "long_done", 15),
+    ("niflheim", "Reino gelado", "Leia 100 capítulos de madrugada", "moon", "ouro", "night", 100),
+    ("bomgosto", "Bom gosto", "Termine 30 obras com nota 4 ou mais", "star", "ouro", "good_done", 30),
+    # ---- platina ----
+    ("platina_conq", "Soberano das conquistas", "Conquiste 70 medalhas", "crown", "platina", "badges", 70),
+    ("platina_seq", "Fogo eterno", "Leia por 200 dias seguidos", "flame", "platina", "longest", 200),
+    ("platina_lend", "Galeria de lendas", "Tenha 50 cartas lendárias (nota 5)", "gem", "platina",
+     "legend_cards", 50),
+    ("platina_cap", "Vinte mil capítulos", "Some 20000 capítulos lidos", "book", "platina", "chapters", 20000),
 ]
 
 
@@ -2875,7 +3014,7 @@ SECRET_BADGES = [
 
 LEGENDARY = {"albumfull", "lendarias10", "hora1000", "mestre40", "seq100", "hora500", "completa100", "estante250", "cap10000", "saga500", "coruja20", "semfronteiras",
              "mes300", "voltaporcima", "completa200", "lendarias25"}
-RARITY = {"Comum": "#9296c0", "Rara": "#4dd0e1", "Épica": "#b86bff", "Lendária": "#ffc233"}
+RARITY = {"Comum": "#9296c0", "Rara": "#4dd0e1", "Épica": "#b86bff", "Lendária": "#ffc233", "Mítica": "#6fe7ff"}
 CATS = ["Leitura", "Tempo", "Sequências", "Coleção", "Avaliação", "Datas"]
 KEY_CAT = {"done": "Leitura", "done_year": "Leitura", "big_done": "Leitura", "huge_done": "Leitura",
            "chapters": "Leitura", "max_day": "Leitura", "best_month": "Leitura", "week_done": "Leitura",
@@ -2890,7 +3029,11 @@ KEY_CAT = {"done": "Leitura", "done_year": "Leitura", "big_done": "Leitura", "hu
            "badges": "Coleção", "epic_cards": "Coleção", "legend_cards": "Coleção", "album_full": "Coleção",
            "rare_cards": "Coleção", "fav_quotes": "Avaliação", "crit_full": "Avaliação", "title_set": "Coleção",
            "customized": "Coleção", "showcase": "Coleção", "mini_uses": "Tempo", "shares": "Coleção",
-           "daily_hit": "Sequências", "first5": "Avaliação"}
+           "daily_hit": "Sequências", "first5": "Avaliação",
+           "novel_done": "Leitura", "manhua_done": "Leitura", "manhwa_done": "Leitura", "webtoon_done": "Leitura",
+           "fantasy_done": "Leitura", "action_done": "Leitura", "long_done": "Leitura", "good_done": "Avaliação",
+           "done_unrated": "Avaliação", "night_days": "Tempo", "friday_max": "Datas", "six_one": "Sequências",
+           "list_done": "Coleção"}
 FAMILY = {"chapters": "Capítulos lidos", "hours": "Horas de leitura", "done": "Leituras completas",
           "longest": "Dias seguidos", "best_month": "Capítulos no mês", "rated": "Notas dadas",
           "favs": "Favoritas", "owned": "Volumes", "n_items": "Tamanho da lista", "quotes": "Citações",
@@ -2927,10 +3070,21 @@ BADGE_TITLES = {
     "lendarias10": "Lenda viva", "albumfull": "Completista", "mestre25": "Mestre das conquistas", "mestre40": "Lenda das conquistas",
     "coruja": "Coruja", "maratona50": "Maratonista de um dia", "trinca": "Trinca de ases",
     "anonovo": "Ano novo, vida nova", "natal": "Espírito natalino", "coruja20": "Coruja veterana",
-    "voltaporcima": "Volta por cima", "domingo": "Domingueiro", "sexta13": "Azarão"}
+    "voltaporcima": "Volta por cima", "domingo": "Domingueiro", "sexta13": "Azarão",
+    "novel1": "komugi", "manhua1": "Goblin", "tipos3": "souls don't meet", "sextou": "Drinks on me",
+    "estante50": "castelão", "anonimo": "nameless", "manhwa10": "Dokkaebi", "manhua5": "madongwang",
+    "novel5": "Wezaemon", "webtoon5": "dreamsoda", "pacto": "Covenant", "semremorso": "machiavelli",
+    "fantasia10": "E.L.F", "acao10": "U.N.C.L.E", "listacheia": "By the table", "pantano": "Pântano de Monter",
+    "noites10": "Corte das corujas", "escala6x1": "Escala 6x1", "hexagono": "Hexagons",
+    "foradalei": "cavalheiros sem lei", "mercenario": "Mercenários ratatosk", "niflheim": "Niflheim",
+    "bomgosto": "the gentlemen",
+    "platina_conq": "Lorde Caído", "platina_seq": "Urusa", "platina_lend": "T-Bone",
+    "platina_cap": "A vida é um documentário"}
 
 
 def badge_rarity(b):
+    if b["tier"] == "platina":
+        return "Mítica"
     return "Lendária" if b["id"] in LEGENDARY else {"bronze": "Comum", "prata": "Rara", "ouro": "Épica"}[b["tier"]]
 
 
@@ -3030,6 +3184,37 @@ def badge_status(app):
                  >= 5 else 0,
         resumes=sum(1 for i in items for e in i.get("history", []) if e.get("kind") == "resume"),
         badges=0)
+    done_ = [i for i in items if i["status"] == "completo"]
+    tg_ = lambda i: {t.strip().lower() for t in i["tags"]}
+    run_, six_, prev_ = 0, 0, None
+    for d_ in sorted(adays):                                   # "6x1": 6 dias seguidos de leitura e folga no 7º
+        if prev_ is not None and (d_ - prev_).days == 1:
+            run_ += 1
+        else:
+            if run_ == 6 and prev_ is not None and prev_ < date.today():
+                six_ += 1
+            run_ = 1
+        prev_ = d_
+    if run_ == 6 and prev_ is not None and prev_ < date.today():
+        six_ += 1
+    lst_done = 0
+    for n_ in {n for i in items for n in i["lists"]}:
+        mem_ = [i for i in items if n_ in i["lists"]]
+        if len(mem_) >= 5 and all(i["status"] == "completo" for i in mem_):
+            lst_done += 1
+    ctx.update(
+        novel_done=sum(1 for i in done_ if i["type"] == "Novel"),
+        manhua_done=sum(1 for i in done_ if i["type"] == "Manhua"),
+        manhwa_done=sum(1 for i in done_ if i["type"] == "Manhwa"),
+        webtoon_done=sum(1 for i in done_ if i["type"] == "Webtoon"),
+        fantasy_done=sum(1 for i in done_ if tg_(i) & {"fantasia", "fantasy", "magia"}),
+        action_done=sum(1 for i in done_ if tg_(i) & {"ação", "acao", "action", "espionagem", "spy", "espiã"}),
+        night_days=sum(1 for v in act.values() if v.get("night", 0) > 0),
+        friday_max=max([v.get("ch", 0) for k, v in act.items() if _wd(k) == 4] or [0]),
+        six_one=six_, list_done=lst_done,
+        done_unrated=sum(1 for i in done_ if not i["rating"]),
+        good_done=sum(1 for i in done_ if i["rating"] >= 4),
+        long_done=sum(1 for i in done_ if max(i["total"], i["seen"]) >= 100))
     ctx["badges"] = sum(1 for lst in (BADGES, SECRET_BADGES) for b_ in lst if b_[5] != "badges"
                         and ctx[b_[5]] >= (b_[6] if b_[6] is not None else max(1, S["goal"])))
     out = []
@@ -3037,6 +3222,8 @@ def badge_status(app):
         for bid, title, desc, ic, tier, key, need in lst:
             need = need if need is not None else max(1, S["goal"])
             have = ctx[key]
+            if bid in dates and have < need:           # já conquistada antes (ex.: "Meta batida" de um ano que passou)
+                have = need
             out.append(dict(id=bid, title=title, desc=desc, icon=ic, tier=tier, have=have, need=need,
                             earned=have >= need, secret=secret, key=key, cat=KEY_CAT.get(key, "Leitura"),
                             date=dates.get(bid, ""), ptitle=BADGE_TITLES.get(bid, title)))
@@ -3045,10 +3232,10 @@ def badge_status(app):
 
 def badge_status_cached(app):
     c = getattr(app, "_bs_cache", None)
-    if c and c[0] == DATA["v"]:
+    if c and c[0] == DATA["v"] and c[2] == date.today():
         return c[1]
     r = badge_status(app)
-    app._bs_cache = (DATA["v"], r)
+    app._bs_cache = (DATA["v"], r, date.today())
     return r
 
 
@@ -3064,33 +3251,6 @@ def fmt_badge_date(iso):
         return ""
 
 
-def panel_badges(parent, app, limit=8):
-    st = badge_status(app)
-    visible = [b for b in st if not b["secret"] or b["earned"]]
-    hidden = len(st) - len(visible)
-    got = sum(1 for b in visible if b["earned"])
-    f, head = panel(parent, "Conquistas")
-    ctk.CTkLabel(head, text=f"{got} de {len(visible)}", text_color=P["muted"], font=ctk.CTkFont(size=12)).pack(
-        side="right")
-    g = ctk.CTkFrame(f, fg_color="transparent")
-    g.pack(fill="x", padx=10)
-    for k, b in enumerate(sorted(visible, key=lambda b: not b["earned"])[:limit]):
-        c = ctk.CTkFrame(g, fg_color="transparent")
-        c.grid(row=k // 4, column=k % 4, padx=4, pady=6)
-        ctk.CTkLabel(c, text="", image=badge_img(b["icon"], b["tier"], b["earned"], 52)).pack()
-        ctk.CTkLabel(c, text=b["title"], text_color=P["text"] if b["earned"] else P["muted"], wraplength=70,
-                     font=ctk.CTkFont(size=10)).pack()
-    for c in range(4):
-        g.grid_columnconfigure(c, weight=1)
-    if hidden:
-        ctk.CTkLabel(f, text=f"+ {hidden} conquistas secretas por descobrir", text_color=P["muted"],
-                     font=ctk.CTkFont(size=11)).pack(anchor="w", padx=16, pady=(2, 0))
-    ctk.CTkButton(f, text="Ver todas as conquistas", image=icon("chevron", 16, P["accent"]), compound="right",
-                  fg_color="transparent", hover_color=P["surface2"], text_color=P["accent"], anchor="w",
-                  command=lambda: app.open_sub(BadgesPage)).pack(fill="x", padx=12, pady=(2, 12))
-    return f
-
-
 # ---- nível de leitor ----
 LEVEL_TITLES = [(1, "Iniciante"), (5, "Leitor"), (10, "Devorador de capítulos"), (20, "Mestre da estante"),
                 (35, "Lenda"), (40, "Guardião das Histórias"), (50, "Mestre dos Capítulos"),
@@ -3098,6 +3258,23 @@ LEVEL_TITLES = [(1, "Iniciante"), (5, "Leitor"), (10, "Devorador de capítulos")
                 (90, "Guardião da Grande Biblioteca"), (100, "Bibliotecário Supremo")]
 LEVEL_COLORS = [(1, "#9296c0"), (5, "#cd7f32"), (10, "#c3cad9"), (20, "#ffc233"), (35, "#ff5c8a"),
                 (50, "#b86bff"), (70, "#4dd0e1"), (90, "#7cf0a8"), (100, "#ffe27a")]
+
+
+def title_is_plat(app):
+    """True se o título mostrado no perfil vem de uma conquista de platina (ganha faíscas)."""
+    bid = app.profile.get("title", "")
+    if not bid:
+        return False
+    try:
+        return any(b["id"] == bid and b["earned"] and b["tier"] == "platina" for b in badge_status_cached(app))
+    except Exception:
+        return False
+
+
+def sparkle(d, cx, cy, r, fill):
+    """Faísca de 4 pontas."""
+    d.polygon([(cx, cy - r), (cx + r * .24, cy - r * .24), (cx + r, cy), (cx + r * .24, cy + r * .24),
+               (cx, cy + r), (cx - r * .24, cy + r * .24), (cx - r, cy), (cx - r * .24, cy - r * .24)], fill=fill)
 
 
 def display_title(app, lv):
@@ -3118,7 +3295,7 @@ def xp_breakdown(app):
     parts = [("Capítulos lidos", sum(i["seen"] for i in items) * 10),
              ("Tempo de leitura", sum_activity(act, "", "min") * 2),
              ("Leituras completas", sum(1 for i in items if i["status"] == "completo") * 150),
-             ("Conquistas", sum(1 for b in badge_status(app) if b["earned"]) * 100),
+             ("Conquistas", sum(1 for b in badge_status_cached(app) if b["earned"]) * 100),
              ("Citações e notas", sum(len(i.get("quotes", [])) for i in items) * 5)]
     return parts, sum(v for _, v in parts)
 
@@ -3130,32 +3307,6 @@ def level_info(xp):
     title = [t for lvl, t in LEVEL_TITLES if L >= lvl][-1]
     col = [c for lvl, c in LEVEL_COLORS if L >= lvl][-1]
     return dict(level=L, title=title, color=col, cur=cur, nxt=nxt, xp=xp, frac=(xp - cur) / (nxt - cur))
-
-
-def panel_level(parent, app):
-    parts, xp = xp_breakdown(app)
-    lv = level_info(xp)
-    f, _ = panel(parent, "Nível de leitor")
-    r = ctk.CTkFrame(f, fg_color="transparent")
-    r.pack(fill="x", padx=16)
-    ctk.CTkLabel(r, text=f"  Nível {lv['level']}  ", fg_color=lv["color"], text_color="#14120a", corner_radius=10,
-                 height=30, font=ctk.CTkFont(size=15, weight="bold")).pack(side="left")
-    ctk.CTkLabel(r, text=lv["title"], text_color=P["text"], font=ctk.CTkFont(size=15, weight="bold")).pack(
-        side="left", padx=10)
-    bar = ctk.CTkProgressBar(f, height=8, fg_color=P["surface2"], progress_color=lv["color"])
-    bar.pack(fill="x", padx=16, pady=(10, 4))
-    animate_bar(bar, lv["frac"])
-    ctk.CTkLabel(f, text=f"{xp - lv['cur']} / {lv['nxt'] - lv['cur']} XP para o nível {lv['level'] + 1}",
-                 text_color=P["muted"], font=ctk.CTkFont(size=12)).pack(anchor="w", padx=16)
-    box = ctk.CTkFrame(f, fg_color="transparent")
-    box.pack(fill="x", padx=16, pady=(8, 14))
-    for lab, v in parts:
-        row = ctk.CTkFrame(box, fg_color="transparent")
-        row.pack(fill="x", pady=1)
-        ctk.CTkLabel(row, text=lab, text_color=P["muted"], font=ctk.CTkFont(size=12)).pack(side="left")
-        ctk.CTkLabel(row, text=f"+{v} XP", text_color=P["text"], font=ctk.CTkFont(size=12, weight="bold")).pack(
-            side="right")
-    return f
 
 
 # ---- estante virtual ----
@@ -3468,9 +3619,14 @@ def make_work_card(app, it, path):
     qy = cy + ch + 120
     if q:
         txt = q["text"].strip()
-        qf = get_font(40)
-        lines = wrap_px(d, txt, qf, W - 70 * 2 - 150, 4)
-        bh = len(lines) * 56 + 160
+        for fs_ in (40, 36, 32, 28, 25):                 # frases longas usam fonte menor, sem cortar
+            qf = get_font(fs_)
+            lines = wrap_px(d, txt, qf, W - 70 * 2 - 150, 60)
+            if len(lines) <= 6:
+                break
+        lines = wrap_px(d, txt, qf, W - 70 * 2 - 150, 7)
+        lp_ = int(fs_ * 1.4)
+        bh = len(lines) * lp_ + 160
         qy = min(qy, H - 210 - bh)
         x0, x1, y0, y1 = 70, W - 70, qy, qy + bh
         panel_ = Image.new("RGBA", (W, H), (0, 0, 0, 0))
@@ -3488,7 +3644,7 @@ def make_work_card(app, it, path):
         d = ImageDraw.Draw(img)
         T((x0 + 40, y0 + 6), "“", 130, acc, True)
         for n, line in enumerate(lines):
-            T((x0 + 100, y0 + 84 + n * 56), line, 40, "#ffffff")
+            T((x0 + 100, y0 + 84 + n * lp_), line, fs_, "#ffffff")
         by = y1 - 52
         cap_t = f"cap. {q.get('ch', 0)}"
         cwid = d.textlength(cap_t, font=get_font(28))
@@ -3611,44 +3767,142 @@ HEAD = 46
 
 
 # ---- gráficos (desenhados com Pillow) ----
-def c_bars(d, x, y, w, h, data, colors=None):
+def hidx(hov):
+    """Número da barra/ponto sob o mouse (regiões chamadas 'tip:N'), ou None."""
+    if isinstance(hov, str) and hov.startswith("tip:"):
+        try:
+            return int(hov[4:])
+        except ValueError:
+            return None
+    return None
+
+
+def tip_bubble(d, cx, y_top, text, panel_w, sub=None):
+    """Balãozinho de informação (aparece sobre o gráfico quando o mouse passa)."""
+    tw = max(TW(d, text, 12, True), TW(d, sub, 11) if sub else 0) + 24
+    h = 40 if sub else 26
+    x0 = max(8, min(panel_w - 8 - tw, cx - tw / 2))
+    y0 = max(4, y_top - h - 9)
+    d.rounded_rectangle([(x0 + 1) * K, (y0 + 3) * K, (x0 + tw + 1) * K, (y0 + h + 3) * K], radius=9 * K,
+                        fill=mix(P["surface"], "#000000", .55))
+    d.rounded_rectangle([x0 * K, y0 * K, (x0 + tw) * K, (y0 + h) * K], radius=9 * K, fill=P["surface2"],
+                        outline=P["accent"], width=K)
+    ax = max(x0 + 12, min(x0 + tw - 12, cx))
+    d.polygon([((ax - 5) * K, (y0 + h - 1) * K), ((ax + 5) * K, (y0 + h - 1) * K), (ax * K, (y0 + h + 6) * K)],
+              fill=P["accent"])
+    d.polygon([((ax - 4) * K, (y0 + h - 2) * K), ((ax + 4) * K, (y0 + h - 2) * K), (ax * K, (y0 + h + 4) * K)],
+              fill=P["surface2"])
+    if sub:
+        T(d, x0 + tw / 2, y0 + 12, text, 12, P["text"], True, "mm")
+        T(d, x0 + tw / 2, y0 + 28, sub, 11, P["muted"], False, "mm")
+    else:
+        T(d, x0 + tw / 2, y0 + h / 2, text, 12, P["text"], True, "mm")
+
+
+def grad_bar(img, d, x0, top, x1, base, col, hot=False):
+    """Barra com topo arredondado e degradê suave (a barra sob o mouse fica mais clara)."""
+    wpx, hpx = max(1, int((x1 - x0) * K)), max(1, int((base - top) * K))
+    if img is None or hpx < 3:
+        d.rectangle([x0 * K, top * K, x1 * K, base * K], fill=col)
+        return
+    g = ImageOps.flip(Image.linear_gradient("L").resize((wpx, hpx)))
+    lo = mix(col, P["surface"], .34 if not hot else .12)
+    hi = mix(col, "#ffffff", .30 if hot else .10)
+    tile = ImageOps.colorize(g, lo, hi).convert("RGBA")
+    m = Image.new("L", (wpx, hpx), 0)
+    ImageDraw.Draw(m).rounded_rectangle([0, 0, wpx - 1, hpx - 1 + int(8 * K)], radius=int(5 * K), fill=255)
+    img.paste(tile, (int(x0 * K), int(top * K)), m)
+
+
+def bar_regs(x, y, w, h, n):
+    bw = w / n
+    return [(x + i * bw, y, x + (i + 1) * bw, y + h, f"tip:{i}") for i in range(n)]
+
+
+def c_bars(d, x, y, w, h, data, colors=None, hov=None, img=None, tips=None):
     mx = max([v for _, v in data] + [1])
     bw = w / len(data)
     y1 = y + h - 20
+    hi_ = hidx(hov)
     for i, (lab, v) in enumerate(data):
         x0, x1 = x + i * bw + 5, x + (i + 1) * bw - 5
         col = colors[i] if colors else P["accent"]
+        hot = i == hi_
         if v:
-            top = y1 - (h - 46) * v / mx
-            d.rectangle([x0 * K, top * K, x1 * K, y1 * K], fill=col)
-            T(d, (x0 + x1) / 2, top - 9, f"{v:g}", 12, P["text"], anchor="mm")
+            top = y1 - (h - 46) * v / mx - (4 if hot else 0)            # a barra "sobe" quando o mouse passa
+            grad_bar(img, d, x0, top, x1, y1, col, hot)
+            T(d, (x0 + x1) / 2, top - 9, f"{v:g}", 13 if hot else 12, P["text"], hot, "mm")
         else:
-            d.line([(x0 * K, y1 * K), (x1 * K, y1 * K)], fill=P["border"], width=2 * K)
-        T(d, (x0 + x1) / 2, y1 + 10, lab, 12, P["muted"], anchor="mm")
+            d.line([(x0 * K, y1 * K), (x1 * K, y1 * K)], fill=P["accent"] if hot else P["border"], width=2 * K)
+        T(d, (x0 + x1) / 2, y1 + 10, lab, 12, P["text"] if hot else P["muted"], hot, "mm")
+    if hi_ is not None and 0 <= hi_ < len(data):
+        lab, v = data[hi_]
+        top = y1 - (h - 46) * v / mx - 4 if v else y1
+        tip_bubble(d, x + (hi_ + .5) * bw, top - 20, tips[hi_] if tips else f"{lab}: {v:g}", x * 2 + w)
 
 
-def c_hist(img, d, x, y, w, h, counts):
+def hist_regs(x, y, w, h, n):
+    return bar_regs(x, y, w, h, n)
+
+
+def c_hist(img, d, x, y, w, h, counts, hov=None):
+    """Notas de 0,5 a 5: barras com degradê, quantidade em cima, escala embaixo e marca da média."""
+    total = sum(counts)
     mx = max(counts + [1])
-    bw = w / len(counts)
-    base = y + h - 24
+    n = len(counts)
+    bw = w / n
+    base = y + h - 30
+    hi_ = hidx(hov)
+    d.line([(x * K, base * K), ((x + w) * K, base * K)], fill=P["border"], width=K)
     for i, v in enumerate(counts):
-        x0, x1 = x + i * bw + 3, x + (i + 1) * bw - 3
+        x0, x1 = x + i * bw + 4, x + (i + 1) * bw - 4
+        hot = i == hi_
         if v:
-            top = base - (base - y - 8) * v / mx
-            d.rectangle([x0 * K, top * K, x1 * K, base * K], fill=P["accent"])
+            top = base - (base - y - 22) * v / mx - (4 if hot else 0)
+            grad_bar(img, d, x0, top, x1, base, P["accent"] if v < mx else mix(P["accent"], "#ffffff", .12), hot)
+            T(d, (x0 + x1) / 2, top - 10, str(v), 13 if hot else 12, P["text"], hot or v == mx, "mm")
         else:
-            d.line([(x0 * K, base * K), (x1 * K, base * K)], fill=P["border"], width=2 * K)
-    T(d, x + 4, y + h - 9, "0,5", 12, P["muted"], anchor="lm")
-    paste_star(img, 11, x + 4 + TW(d, "0,5", 12) + 3, y + h - 15)
-    T(d, x + w - 4 - 14, y + h - 9, "5", 12, P["muted"], anchor="rm")
-    paste_star(img, 11, x + w - 4 - 11, y + h - 15)
+            d.rounded_rectangle([x0 * K, (base - 3) * K, x1 * K, base * K], radius=2 * K,
+                                fill=P["accent"] if hot else mix(P["border"], P["surface2"], .5))
+        r = (i + 1) / 2
+        if r == int(r) or i == 0:
+            T(d, (x0 + x1) / 2, base + 12, f"{r:g}".replace(".", ","), 12, P["text"] if hot else P["muted"], hot, "mm")
+        elif hot:
+            T(d, (x0 + x1) / 2, base + 12, f"{r:g}".replace(".", ","), 11, P["text"], True, "mm")
+    paste_star(img, 12, x + w - 12, base + 6)
+    if total:                                                              # marca da média
+        avg = sum(((i + 1) / 2) * c for i, c in enumerate(counts)) / total
+        ax = x + (avg * 2 - 0.5) * bw
+        d.polygon([((ax - 5) * K, (base + 22) * K), ((ax + 5) * K, (base + 22) * K), (ax * K, (base + 15) * K)],
+                  fill=GOLD_HEX)
+        T(d, ax, base + 30, "média", 10, GOLD_HEX, True, "mm")
+    if hi_ is not None and 0 <= hi_ < n:
+        r = (hi_ + 1) / 2
+        v = counts[hi_]
+        pct = f" · {round(100 * v / total)}%" if total else ""
+        top = base - (base - y - 22) * v / mx - 4 if v else base
+        tip_bubble(d, x + (hi_ + .5) * bw, top - 18, "Nota " + f"{r:g}".replace(".", ","),
+                   panel_w=x * 2 + w, sub=f"{v} {'obra' if v == 1 else 'obras'}{pct}")
 
 
-def c_radar(d, x, y, w, h, labels, values):
+def radar_regs(x, y, w, h, values):
+    n = len(values)
+    cx, cy = x + w / 2, y + h / 2
+    R = max(30, min(w / 2 - 78, h / 2 - 28))
+    out = []
+    for i, v in enumerate(values):
+        a = -math.pi / 2 + i * 2 * math.pi / n
+        px_, py_ = cx + R * max(.14, v) * math.cos(a), cy + R * max(.14, v) * math.sin(a)
+        out.append((px_ - 20, py_ - 20, px_ + 20, py_ + 20, f"tip:{i}"))
+    return out
+
+
+def c_radar(d, x, y, w, h, labels, values, hov=None, tips=None):
     n = len(labels)
     ang = [-math.pi / 2 + i * 2 * math.pi / n for i in range(n)]
     cx, cy = x + w / 2, y + h / 2
     R = max(30, min(w / 2 - 78, h / 2 - 28))
+    hi_ = hidx(hov)
     for lvl in (1, .66, .33):
         pts = [((cx + R * lvl * math.cos(a)) * K, (cy + R * lvl * math.sin(a)) * K) for a in ang]
         d.line(pts + [pts[0]], fill=P["border"], width=K)
@@ -3658,60 +3912,102 @@ def c_radar(d, x, y, w, h, labels, values):
            for v, a in zip(values, ang)]
     d.polygon(pts, fill=mix(P["accent"], P["surface"], .62))
     d.line(pts + [pts[0]], fill=P["accent"], width=2 * K, joint="curve")
-    for px_, py_ in pts:
-        d.ellipse([px_ - 4 * K, py_ - 4 * K, px_ + 4 * K, py_ + 4 * K], fill=P["accent"])
-    for lab, a in zip(labels, ang):
+    for i, (px_, py_) in enumerate(pts):
+        r_ = (7 if i == hi_ else 4) * K
+        d.ellipse([px_ - r_, py_ - r_, px_ + r_, py_ + r_], fill=P["accent"] if i != hi_ else "#ffffff",
+                  outline=P["accent"], width=2 * K if i == hi_ else 0)
+    for i, (lab, a) in enumerate(zip(labels, ang)):
         cs, sn = math.cos(a), math.sin(a)
         ax = "l" if cs > .3 else "r" if cs < -.3 else "m"
         ay = "s" if sn < -.3 else "a" if sn > .3 else "m"
-        T(d, cx + (R + 12) * cs, cy + (R + 12) * sn, lab[:14], 13, P["muted"], anchor=ax + ay)
+        T(d, cx + (R + 12) * cs, cy + (R + 12) * sn, lab[:14], 13, P["text"] if i == hi_ else P["muted"],
+          i == hi_, anchor=ax + ay)
+    if hi_ is not None and 0 <= hi_ < n:
+        tip_bubble(d, pts[hi_][0] / K, pts[hi_][1] / K - 8, tips[hi_] if tips else labels[hi_], x * 2 + w)
 
 
-def c_donut(d, x, y, w, h, data):
+def donut_regs(x, y, w, h, n):
+    size = min(h - 16, w * 0.46)
+    cx, cy = x + 20 + size / 2, y + h / 2
+    lx = cx + size / 2 + 30
+    yy = max(y + 16, cy - n * 13 + 13)
+    return [(lx - 10, yy + 26 * i - 13, x + w, yy + 26 * i + 13, f"tip:{i}") for i in range(n)]
+
+
+def c_donut(d, x, y, w, h, data, hov=None):
     total = sum(v for _, v, _ in data)
     size = min(h - 16, w * 0.46)
     cx, cy = x + 20 + size / 2, y + h / 2
     th = size * 0.17
+    hi_ = hidx(hov)
     box = [(cx - size / 2 + th / 2) * K, (cy - size / 2 + th / 2) * K, (cx + size / 2 - th / 2) * K,
            (cy + size / 2 - th / 2) * K]
     if total <= 0:
         d.arc(box, 0, 359.9, fill=P["surface2"], width=int(th * K))
     else:
         acc = 270.0
-        for lab, v, col in data:
+        for i, (lab, v, col) in enumerate(data):
             if v <= 0:
                 continue
             ext = 360.0 * v / total
-            d.arc(box, acc, acc + ext + min(2.0, ext / 4), fill=col, width=int(th * K))
+            if i == hi_:                                                    # fatia sob o mouse: mais grossa
+                gb = [box[0] - th * K * .18, box[1] - th * K * .18, box[2] + th * K * .18, box[3] + th * K * .18]
+                d.arc(gb, acc, acc + ext + min(2.0, ext / 4), fill=mix(col, "#ffffff", .15), width=int(th * K * 1.36))
+            else:
+                d.arc(box, acc, acc + ext + min(2.0, ext / 4), fill=col if hi_ is None else mix(col, P["surface"], .45),
+                      width=int(th * K))
             acc += ext
-    T(d, cx, cy - 8, str(total), 20, P["text"], True, "mm")
-    T(d, cx, cy + 14, "leituras", 13, P["muted"], anchor="mm")
+    if hi_ is not None and 0 <= hi_ < len(data) and total > 0:
+        lab, v, col = data[hi_]
+        T(d, cx, cy - 8, str(v), 22, P["text"], True, "mm")
+        T(d, cx, cy + 14, f"{round(100 * v / total)}%", 13, col, True, "mm")
+    else:
+        T(d, cx, cy - 8, str(total), 20, P["text"], True, "mm")
+        T(d, cx, cy + 14, "leituras", 13, P["muted"], anchor="mm")
     lx = cx + size / 2 + 30
     yy = max(y + 16, cy - len(data) * 13 + 13)
-    for lab, v, col in data:
+    for i, (lab, v, col) in enumerate(data):
+        if i == hi_:
+            d.rounded_rectangle([(lx - 10) * K, (yy - 13) * K, (x + w - 4) * K, (yy + 13) * K], radius=8 * K,
+                                fill=P["surface2"])
         d.ellipse([lx * K, (yy - 6) * K, (lx + 12) * K, (yy + 6) * K], fill=col)
-        T(d, lx + 20, yy, lab, 13, P["text"], anchor="lm")
-        T(d, x + w - 16, yy, v, 13, P["muted"], anchor="rm")
+        T(d, lx + 20, yy, lab, 13, P["text"], i == hi_, anchor="lm")
+        T(d, x + w - 16, yy, v, 13, P["text"] if i == hi_ else P["muted"], i == hi_, anchor="rm")
         yy += 26
 
 
-def c_line(d, x, y, w, h, data):
+def line_regs(x, y, w, h, n):
+    left, right = x + 16, x + w - 16
+    step = (right - left) / (n - 1)
+    return [(left + i * step - step / 2, y, left + i * step + step / 2, y + h, f"tip:{i}") for i in range(n)]
+
+
+def c_line(d, x, y, w, h, data, hov=None, tips=None):
     n = len(data)
     left, right, top, base = x + 16, x + w - 16, y + 22, y + h - 24
     mx = max([v for _, v in data] + [1])
     step = (right - left) / (n - 1)
+    hi_ = hidx(hov)
     pts = [(left + i * step, base - (base - top) * v / mx) for i, (_, v) in enumerate(data)]
     sm = smooth_pts(pts)
     area = [(pts[0][0] * K, base * K)] + [(a * K, b * K) for a, b in sm] + [(pts[-1][0] * K, base * K)]
     d.polygon(area, fill=mix(P["accent"], P["surface"], .82))
     d.line([(left * K, base * K), (right * K, base * K)], fill=P["border"], width=K)
+    if hi_ is not None and 0 <= hi_ < n:                                   # guia vertical no ponto
+        gx = pts[hi_][0]
+        for yy in range(int(pts[hi_][1]), int(base), 6):
+            d.line([(gx * K, yy * K), (gx * K, min(base, yy + 3) * K)], fill=mix(P["accent"], P["surface"], .5), width=K)
     d.line([(a * K, b * K) for a, b in sm], fill=P["accent"], width=3 * K, joint="curve")
-    for (lab, v), (px_, py_) in zip(data, pts):
-        d.ellipse([(px_ - 4) * K, (py_ - 4) * K, (px_ + 4) * K, (py_ + 4) * K], fill=P["surface"],
-                  outline=P["accent"], width=2 * K)
-        T(d, px_, base + 12, lab, 12, P["muted"], anchor="mm")
-        if v and v == mx:
+    for i, ((lab, v), (px_, py_)) in enumerate(zip(data, pts)):
+        r = 6 if i == hi_ else 4
+        d.ellipse([(px_ - r) * K, (py_ - r) * K, (px_ + r) * K, (py_ + r) * K],
+                  fill=P["accent"] if i == hi_ else P["surface"], outline=P["accent"], width=2 * K)
+        T(d, px_, base + 12, lab, 12, P["text"] if i == hi_ else P["muted"], i == hi_, anchor="mm")
+        if v and v == mx and hi_ is None:
             T(d, px_, py_ - 13, f"{v:g}", 12, P["text"], anchor="mm")
+    if hi_ is not None and 0 <= hi_ < n:
+        lab, v = data[hi_]
+        tip_bubble(d, pts[hi_][0], pts[hi_][1] - 8, tips[hi_] if tips else f"{lab}: {v:g}", x * 2 + w)
 
 
 def heat_geom(w):
@@ -3726,12 +4022,34 @@ def heat_geom(w):
     return gap, weeks, cell, int(7 * (cell + gap) + 30)
 
 
-def c_heat(d, x, y, w, act):
+def heat_cells(w):
+    """(semana, dia-da-semana, data) de cada quadradinho do mapa (só até hoje)."""
+    gap, weeks, cell, _h = heat_geom(w)
+    today = date.today()
+    start = today - timedelta(days=today.weekday() + 7 * (weeks - 1))
+    out = []
+    for wk in range(weeks):
+        for dd in range(7):
+            day = start + timedelta(days=7 * wk + dd)
+            if day <= today:
+                out.append((wk, dd, day))
+    return out
+
+
+def heat_regs(x, y, w):
+    gap, weeks, cell, _h = heat_geom(w)
+    return [(x + 4 + wk * (cell + gap), y + 22 + dd * (cell + gap), x + 4 + wk * (cell + gap) + cell + gap,
+             y + 22 + dd * (cell + gap) + cell + gap, f"tip:{wk * 7 + dd}") for wk, dd, _day in heat_cells(w)]
+
+
+def c_heat(d, x, y, w, act, hov=None):
     gap, weeks, cell, _h = heat_geom(w)
     today = date.today()
     start = today - timedelta(days=today.weekday() + 7 * (weeks - 1))
     shades = [mix(P["surface2"], P["accent"], t) for t in (0, .3, .55, .8, 1)]
     last_m = None
+    hi_ = hidx(hov)
+    hot = None
     for wk in range(weeks):
         for dd in range(7):
             day = start + timedelta(days=7 * wk + dd)
@@ -3742,10 +4060,21 @@ def c_heat(d, x, y, w, act):
             lv = 0 if v <= 0 else 1 if v < 3 else 2 if v < 6 else 3 if v < 10 else 4
             px_, py_ = x + 4 + wk * (cell + gap), y + 22 + dd * (cell + gap)
             d.rectangle([px_ * K, py_ * K, (px_ + cell) * K, (py_ + cell) * K], fill=shades[lv])
+            if hi_ == wk * 7 + dd:
+                hot = (px_, py_, day, e)
         m = (start + timedelta(days=7 * wk)).month
         if m != last_m:
             T(d, x + 4 + wk * (cell + gap), y + 8, MESES[m - 1], 12, P["muted"], anchor="lm")
             last_m = m
+    if hot:
+        px_, py_, day, e = hot
+        d.rectangle([(px_ - 1.5) * K, (py_ - 1.5) * K, (px_ + cell + 1.5) * K, (py_ + cell + 1.5) * K],
+                    outline="#ffffff", width=2 * K)
+        ch, mn = e.get("ch", 0), e.get("min", 0)
+        head_ = f"{day.day} de {MESES_LONGOS[day.month - 1]} de {day.year}"
+        sub = (f"{ch} {'capítulo' if ch == 1 else 'capítulos'}" + (f" · {fmt_minutes(mn)}" if mn else "")) if (ch or mn) \
+            else "sem leitura"
+        tip_bubble(d, px_ + cell / 2, py_ - 2, head_, x * 2 + w, sub=sub)
 
 
 # ---- blocos e a "tela" que os mostra ----
@@ -3799,7 +4128,7 @@ class BlockView:
             try:
                 self.app.after_cancel(an["job"])
             except Exception:
-                pass
+                log_error()
             try:
                 self.cv.delete(an["item"])
             except tk.TclError:
@@ -3879,7 +4208,7 @@ class BlockView:
             try:
                 self.app.after_cancel(self._rz)
             except Exception:
-                pass
+                log_error()
         self._rz = self.app.after(60, self._do_resize)
 
     def _do_resize(self):
@@ -3989,7 +4318,7 @@ class BlockView:
         if i is not None:
             self._set(i, name)
         try:
-            self.cv.configure(cursor="hand2" if name else "")
+            self.cv.configure(cursor="hand2" if (name and not str(name).startswith("tip:")) else "")
         except tk.TclError:
             pass
         self._tilt(i, name, e)
@@ -4136,8 +4465,16 @@ def spec_ratings(app):
         T(d, x, 24, avg, 15, GOLD_HEX, True, "rm")
         paste_star(img, 15, x - TW(d, avg, 15, True) - 19, 17)
 
-    return PanelSpec("Avaliações", lambda w: HEAD + 110 + 14,
-                     lambda img, d, w, h, hov: c_hist(img, d, 16, HEAD, w - 32, 110, counts), head=head)
+    if not rated:
+        msg = "Dê nota às suas leituras para ver como você avalia."
+
+        def empty(img, d, w, h, hov):
+            for n_, line in enumerate(wrap_l(msg, 13, w - 32)):
+                T(d, 16, HEAD + n_ * 18, line, 13, P["muted"])
+        return PanelSpec("Avaliações", lambda w: HEAD + 40, empty)
+    return PanelSpec("Avaliações", lambda w: HEAD + 130 + 14,
+                     lambda img, d, w, h, hov: c_hist(img, d, 16, HEAD, w - 32, 130, counts, hov), head=head,
+                     regs=lambda w, h: hist_regs(16, HEAD, w - 32, 130, 10))
 
 
 def spec_genres(app):
@@ -4151,22 +4488,27 @@ def spec_genres(app):
 
         return PanelSpec("Principais gêneros", lambda w: HEAD + len(wrap_l(msg, 13, w - 32)) * 18 + 18, body)
     mx = top[0][1]
+    tips_ = [f"{t} · {n} {'obra' if n == 1 else 'obras'}" for t, n in top]
     return PanelSpec("Principais gêneros", lambda w: HEAD + 250 + 10,
                      lambda img, d, w, h, hov: c_radar(d, 10, HEAD, w - 20, 250, [t for t, _ in top],
-                                                       [n / mx for _, n in top]))
+                                                       [n / mx for _, n in top], hov, tips_),
+                     regs=lambda w, h: radar_regs(10, HEAD, w - 20, 250, [n / mx for _, n in top]))
 
 
 def spec_types(app):
     data = [(t, sum(1 for i in app.items if i["type"] == t)) for t in TYPES]
     cols = [type_color(t) for t in TYPES]
+    tips_ = [f"{t} · {n} {'leitura' if n == 1 else 'leituras'}" for t, n in data]
     return PanelSpec("Por tipo", lambda w: HEAD + 150 + 14,
-                     lambda img, d, w, h, hov: c_bars(d, 16, HEAD, w - 32, 150, data, cols))
+                     lambda img, d, w, h, hov: c_bars(d, 16, HEAD, w - 32, 150, data, cols, hov, img, tips_),
+                     regs=lambda w, h: bar_regs(16, HEAD, w - 32, 150, len(data)))
 
 
 def spec_status(app):
     data = [(STATUS[k], sum(1 for i in app.items if i["status"] == k), P["status"][k]) for k in STATUS]
     return PanelSpec("Por status", lambda w: HEAD + 190 + 14,
-                     lambda img, d, w, h, hov: c_donut(d, 16, HEAD, w - 32, 190, data))
+                     lambda img, d, w, h, hov: c_donut(d, 16, HEAD, w - 32, 190, data, hov),
+                     regs=lambda w, h: donut_regs(16, HEAD, w - 32, 190, len(data)))
 
 
 def spec_chapters(app):
@@ -4178,8 +4520,10 @@ def spec_chapters(app):
             mm += 12
             yy -= 1
         data.append((MESES[mm - 1], sum_activity(app.activity, f"{yy:04d}-{mm:02d}", "ch")))
+    tips_ = [f"{m} · {v:g} {'capítulo' if v == 1 else 'capítulos'}" for m, v in data]
     return PanelSpec("Capítulos por mês", lambda w: HEAD + 170 + 14,
-                     lambda img, d, w, h, hov: c_line(d, 16, HEAD, w - 32, 170, data))
+                     lambda img, d, w, h, hov: c_line(d, 16, HEAD, w - 32, 170, data, hov, tips_),
+                     regs=lambda w, h: line_regs(16, HEAD, w - 32, 170, len(data)))
 
 
 def spec_months(app):
@@ -4188,19 +4532,26 @@ def spec_months(app):
     done = [parse_date(i["finished"]) for i in app.items if i["status"] == "completo"]
     data = [(m, sum(1 for d_ in done if d_ and d_.year == year and d_.month == n + 1)) for n, m in enumerate(mes)]
 
+    tips_ = [f"{MESES_LONGOS[n].capitalize()} · {v} {'completa' if v == 1 else 'completas'}"
+             for n, (_m, v) in enumerate(data)]
+
     def body(img, d, w, h, hov):
-        c_bars(d, 16, HEAD, w - 32, 150, data)
+        c_bars(d, 16, HEAD, w - 32, 150, data, None, hov, img, tips_)
         T(d, 16, HEAD + 156, "Só entram leituras com data de fim preenchida.", 12, P["muted"])
 
-    return PanelSpec(f"Completas por mês em {year}", lambda w: HEAD + 150 + 6 + 20 + 12, body)
+    return PanelSpec(f"Completas por mês em {year}", lambda w: HEAD + 150 + 6 + 20 + 12, body,
+                     regs=lambda w, h: bar_regs(16, HEAD, w - 32, 150, len(data)))
 
 
 def spec_recent(app):
     today = date.today()
     days = [today - timedelta(days=13 - k) for k in range(14)]
     data = [(str(d_.day), app.activity.get(d_.isoformat(), {}).get("ch", 0)) for d_ in days]
+    tips_ = [f"{d_.day:02d}/{d_.month:02d} · {v:g} {'capítulo' if v == 1 else 'capítulos'}"
+             for d_, (_l, v) in zip(days, data)]
     return PanelSpec("Capítulos nos últimos 14 dias", lambda w: HEAD + 150 + 14,
-                     lambda img, d, w, h, hov: c_bars(d, 16, HEAD, w - 32, 150, data))
+                     lambda img, d, w, h, hov: c_bars(d, 16, HEAD, w - 32, 150, data, None, hov, img, tips_),
+                     regs=lambda w, h: bar_regs(16, HEAD, w - 32, 150, len(data)))
 
 
 def spec_criteria(app):
@@ -4213,8 +4564,11 @@ def spec_criteria(app):
             ("Arte", avg([i["crit"].get("art", 0) for i in items if i["crit"].get("art")])),
             ("Persona.", avg([i["crit"].get("chars", 0) for i in items if i["crit"].get("chars")])),
             ("Geral", avg([i["rating"] for i in items if i["rating"]]))]
+    full = ["História", "Arte", "Personagens", "Geral"]
+    tips_ = [f"{n_} · média {v:g}".replace(".", ",") for n_, (_l, v) in zip(full, data)]
     return PanelSpec("Médias das suas notas", lambda w: HEAD + 150 + 14,
-                     lambda img, d, w, h, hov: c_bars(d, 16, HEAD, w - 32, 150, data))
+                     lambda img, d, w, h, hov: c_bars(d, 16, HEAD, w - 32, 150, data, None, hov, img, tips_),
+                     regs=lambda w, h: bar_regs(16, HEAD, w - 32, 150, len(data)))
 
 
 def spec_goal(app, view):
@@ -4267,9 +4621,10 @@ def spec_activity(app):
             cx = 12 + (i + .5) * cw
             T(d, cx, HEAD + 4, val, 20, P["text"], True, "ma")
             T(d, cx, HEAD + 34, lab, 11, P["muted"], False, "ma")
-        c_heat(d, 16, HEAD + 60, w - 32, act)
+        c_heat(d, 16, HEAD + 60, w - 32, act, hov)
 
-    return PanelSpec("Atividade de leitura", lambda w: HEAD + 60 + heat_geom(w - 32)[3] + 14, body)
+    return PanelSpec("Atividade de leitura", lambda w: HEAD + 60 + heat_geom(w - 32)[3] + 14, body,
+                     regs=lambda w, h: heat_regs(16, HEAD + 60, w - 32))
 
 
 def spec_level(app):
@@ -4303,7 +4658,7 @@ def spec_badges(app, view):
     visible = [b for b in st if not b["secret"] or b["earned"]]
     hidden = len(st) - len(visible)
     got = sum(1 for b in visible if b["earned"])
-    rank = {"ouro": 0, "prata": 1, "bronze": 2}
+    rank = {"platina": -1, "ouro": 0, "prata": 1, "bronze": 2}
     best = sorted([b for b in visible if b["earned"]], key=lambda b: rank[b["tier"]])[:4]
     near = sorted([b for b in visible if not b["earned"]], key=lambda b: -min(1, b["have"] / b["need"]))[:4]
     secs = [x for x in (("Em destaque", best), ("Quase lá", near)) if x[1]]
@@ -4460,6 +4815,11 @@ def profile_header(app, w, hov, pr, lv, m=0):
     d.rounded_rectangle([cx0 * K, (y0 + 10) * K, (cx0 + cw_) * K, (y0 + 32) * K], radius=6 * K,
                         fill=mix(tcol, "#000000", .55), outline=mix(tcol, "#000000", .15), width=K)
     T(d, cx0 + cw_ / 2, y0 + 21, chip, 12, mix(tcol, "#ffffff", .25), True, "mm")
+    if title_is_plat(app):                                   # título de platina: contorno claro e faíscas
+        d.rounded_rectangle([(cx0 - 2) * K, (y0 + 8) * K, (cx0 + cw_ + 2) * K, (y0 + 34) * K], radius=7 * K,
+                            outline=mix(tcol, "#ffffff", .55), width=1)
+        for fx, fy, fr in ((cx0 + cw_ + 1, y0 + 8, 5), (cx0 - 1, y0 + 34, 3.5), (cx0 + cw_ + 7, y0 + 27, 3)):
+            sparkle(d, fx * K, fy * K, fr * K, "#eaffff")
     # linha 2: @ e vitrine
     T(d, ix, y0 + 44, pr["handle"], 15, P["accent"], False, "lm")
     d2 = d
@@ -4809,7 +5169,7 @@ class ProfilePage(ImgPage):
                         pid = hits[int(hov[2:])][4]["id"]
                         return shelf_pil(ents, int(LW * K), K, pull=pid, cover=app._load_cover)[0].convert("RGBA")
                     except Exception:
-                        pass
+                        log_error()
                 return simg.convert("RGBA")
             sb = Blk(f"shelf-{LW}", pad, y, LW, sh, sdraw, regs,
                      lambda n_, hits=hits: app.open_detail(hits[int(n_[2:])][4]))
@@ -4827,7 +5187,6 @@ class ProfilePage(ImgPage):
             out.append(sp.block(name, rx, ry, rw, h))
             ry += h + 14
         return out
-
 
 
 # ---------- cartas colecionáveis ----------
@@ -4862,12 +5221,6 @@ def _TS(d, x, y, text, size, fill, bold=False, anchor="la", stroke=2):
         d.text((x * K, y * K), str(text), font=font, fill=fill, anchor=anchor, stroke_width=sw, stroke_fill="#05050c")
     except (ValueError, TypeError):
         d.text((x * K, y * K), str(text), font=font, fill=fill)
-
-
-def _spark(d, cx, cy, r, fill):
-    pts = [(cx, cy - r), (cx + r * .22, cy - r * .22), (cx + r, cy), (cx + r * .22, cy + r * .22),
-           (cx, cy + r), (cx - r * .22, cy + r * .22), (cx - r, cy), (cx - r * .22, cy - r * .22)]
-    d.polygon([(x * K, y * K) for x, y in pts], fill=fill)
 
 
 def _rainbow(size, hue0, span, alpha=255, step=3):
@@ -4992,8 +5345,12 @@ def card_pil(app, it, num, total, shine=0):
         "lm", 2.2)
     if q:
         txt = " ".join(str(q["text"]).split())
-        for k_, ln in enumerate(wrap_l(txt, 11.5, W - 2 * pad, maxlines=3)):
-            _TS(d, pad, y + 26 + k_ * 15, ln, 11.5, "#ffffff", False, "la", 1.8)
+        fs_, lp_, ml_ = 11.5, 15, 3
+        for fs_, lp_, ml_ in ((11.5, 15, 3), (10, 12.5, 4), (9, 11.5, 4)):      # frase longa: letra menor, mais linhas
+            if len(wrap_l(txt, fs_, W - 2 * pad, maxlines=30)) <= ml_:
+                break
+        for k_, ln in enumerate(wrap_l(txt, fs_, W - 2 * pad, maxlines=ml_)):
+            _TS(d, pad, y + 26 + k_ * lp_, ln, fs_, "#ffffff", False, "la", 1.8)
     else:
         _TS(d, pad, y + 26, "Salve uma citação na página da obra.", 11.5, "#c7c9dc", False, "la", 1.8)
     # ---- ataque: capítulos ----
@@ -5076,7 +5433,6 @@ def card_back(w, h):
     f = get_font(int(w * .5), True)
     d.text((w, h), "LF", font=f, fill=(255, 255, 255, 190), anchor="mm")
     return out
-
 
 
 def _homography(dst, src):
@@ -5200,7 +5556,7 @@ class CollectionPage(ImgPage):
             try:
                 self.after_cancel(self._qj)
             except Exception:
-                pass
+                log_error()
         self._qj = self.after(220, self.view.rebuild)
 
     def _key(self, e):
@@ -5764,21 +6120,16 @@ class GalleryPage(ImgPage):
             if i.get("shots"):
                 cnt[i["id"]] = len(i["shots"])
         its = sorted([i for i in self.app.items if cnt[i["id"]]], key=lambda i: (-cnt[i["id"]], i["title"].lower()))[:40]
-        m = tk.Menu(self, tearoff=0, bg=P["surface"], fg=P["text"], activebackground=P["surface2"],
-                    activeforeground=P["text"], bd=0, relief="flat", font=("TkDefaultFont", fpt(11)))
-
         def pick(i):
             self.obra = i
             self.view.rebuild()
-        m.add_command(label=("✓  " if self.obra is None else "      ") + "Todas as obras", command=lambda: pick(None))
+        labels = {"Todas as obras": None}
         for i in its:
             t = i["title"] if len(i["title"]) < 40 else i["title"][:38] + "…"
-            m.add_command(label=("✓  " if self.obra is i else "      ") + f"{t}  ({cnt[i['id']]})",
-                          command=lambda i=i: pick(i))
-        try:
-            m.tk_popup(self.winfo_pointerx(), self.winfo_pointery())
-        finally:
-            m.grab_release()
+            labels[f"{t}  ({cnt[i['id']]})"] = i
+        cur = next((k for k, v in labels.items() if v is self.obra), "Todas as obras")
+        list_popup(self.app, self.winfo_pointerx(), self.winfo_pointery(), px(380), list(labels), cur,
+                   lambda k: pick(labels[k]), marks=True, above_y=self.winfo_pointery())
 
     def layout(self, avail):
         app, items = self.app, self.app.items
@@ -6066,7 +6417,7 @@ class HomePage(ImgPage):
             try:
                 self.view.rebuild()
             except Exception:
-                pass
+                log_error()
 
     # ---- carrossel de frases ----
     def _qbg(self, it, w, h):
@@ -6111,8 +6462,15 @@ class HomePage(ImgPage):
             cw_, ch_ = 150, 216
             maxw = w - 70 - (cw_ + 70)
             txt = " ".join(str(q.get("text", "")).split())
-            size = 30 if len(txt) < 90 else 26 if len(txt) < 180 else 22 if len(txt) < 300 else 18
-            lines = wrap_l(txt, size, maxw, maxlines=7 if size < 26 else 5)
+            avail = max(60, h - 168)                     # altura livre para o texto (sobra espaço para título e pontinhos)
+            size = 30 if len(txt) < 90 else 26 if len(txt) < 180 else 22
+            while True:                                  # diminui a fonte até o texto inteiro caber
+                lh = int(size * 1.4)
+                lines = wrap_l(txt, size, maxw, maxlines=200)
+                if len(lines) * lh <= avail or size <= 13:
+                    break
+                size -= 1
+            lines = wrap_l(txt, size, maxw, maxlines=max(1, int(avail // lh)))
             lh = int(size * 1.4)
             block = len(lines) * lh + 16 + 24 + 20
             y = max(64, (h - block) / 2 + 14)
@@ -6371,7 +6729,7 @@ class HomePage(ImgPage):
     def _spec_badges(self):
         app = self.app
         st = [b for b in badge_status_cached(app) if b["earned"]]
-        rk = {"bronze": 0, "prata": 1, "ouro": 2}
+        rk = {"bronze": 0, "prata": 1, "ouro": 2, "platina": 3}
         dated = sorted([b for b in st if b["date"]], key=lambda b: b["date"], reverse=True)[:3]
         rest = sorted([b for b in st if not b["date"]], key=lambda b: -rk[b["tier"]])
         rows = (dated + rest)[:6]
@@ -6407,17 +6765,6 @@ class HomePage(ImgPage):
         return PanelSpec("Conquistas recentes", lambda w: HEAD + 3 * 66 + 8, body, regs=regs_,
                          act=lambda n: app.open_sub(BadgesPage))
 
-    def _spec_days(self):
-        act = self.app.activity
-        days = [date.today() - timedelta(days=13 - k) for k in range(14)]
-        data = [(str(d_.day), act.get(d_.isoformat(), {}).get("ch", 0)) for d_ in days]
-        tot = sum(v for _, v in data)
-
-        def head(img, d, w):
-            T(d, w - 16, 24, f"{tot} capítulos", 12, P["muted"], anchor="rm")
-
-        return PanelSpec("Últimos 14 dias", lambda w: HEAD + 3 * 66 + 8,
-                         lambda img, d, w, h, hov: c_bars(d, 16, HEAD, w - 32, h - HEAD - 12, data), head=head)
 
     def _spec_cards(self):
         app = self.app
@@ -6531,9 +6878,6 @@ class StatsPage(ImgPage):
         return out
 
 
-
-
-
 # ---------- editor de imagem (banner e foto de perfil) ----------
 class CropDialog(tk.Toplevel):
     """Janela para enquadrar a imagem: arraste para mover, use o controle (ou a rodinha) para ampliar, gire e aplique."""
@@ -6545,7 +6889,7 @@ class CropDialog(tk.Toplevel):
         self.src0.thumbnail((3200, 3200))
         self.src = self.src0
         self.round = kind == "avatar"
-        self.out = (500, 500) if self.round else (1800, 600)
+        self.out = (500, 500) if self.round else (3200, 640)
         self.title("Editar imagem")
         self.withdraw()                                # monta escondida e só mostra no fim
         self.resizable(False, False)
@@ -6560,8 +6904,8 @@ class CropDialog(tk.Toplevel):
         box.pack(fill="both", expand=True)
         self.transient(app)
         self.CW, self.CH = px(600), px(380)
-        fw = px(250) if self.round else px(540)
-        self.fw, self.fh = fw, (fw if self.round else fw // 3)
+        fw = px(250) if self.round else px(560)
+        self.fw, self.fh = fw, (fw if self.round else fw // 5)
         self.fx, self.fy = (self.CW - self.fw) // 2, (self.CH - self.fh) // 2
         head = ctk.CTkFrame(box, fg_color="transparent")
         head.pack(fill="x", padx=24, pady=(18, 12))
@@ -6723,7 +7067,11 @@ class CropDialog(tk.Toplevel):
         x0, y0 = (self.fx - self.ox) / s, (self.fy - self.oy) / s
         x1, y1 = x0 + self.fw / s, y0 + self.fh / s
         box = (max(0, round(x0)), max(0, round(y0)), min(self.src.width, round(x1)), min(self.src.height, round(y1)))
-        self.result = self.src.crop(box).resize(self.out, Image.LANCZOS)
+        crop = self.src.crop(box)
+        out = self.out
+        if not self.round and crop.width < out[0]:                 # não "estica" imagem pequena (só pesa e embaça)
+            out = (max(500, crop.width), max(100, crop.width // 5))
+        self.result = crop.resize(out, Image.LANCZOS)
         self.destroy()
 
 
@@ -6884,7 +7232,7 @@ def title_picker(app, entries, current, on_pick):
             return False
         if f == "Bloqueados" and e[4]:
             return False
-        if f in ("Bronze", "Prata", "Ouro") and e[3] != f.lower():
+        if f in ("Bronze", "Prata", "Ouro", "Platina") and e[3] != f.lower():
             return False
         q = norm(st["q"])
         return not q or q in norm(e[0]) or q in norm(e[2])
@@ -6918,7 +7266,9 @@ def title_picker(app, entries, current, on_pick):
                 dot.create_oval(px(2), px(2), px(12), px(12), fill=P["accent"], outline="")
             col = tk.Frame(r, bg=bg0)
             col.pack(side="left", fill="x", expand=True, pady=px(6))
-            tk.Label(col, text=name, bg=bg0, fg=P["text"] if ok else P["muted"], font=fnb, anchor="w").pack(fill="x")
+            tk.Label(col, text=("✦ " + name) if tier == "platina" else name, bg=bg0,
+                     fg=(TIER_COLOR["platina"] if tier == "platina" else P["text"]) if ok else P["muted"],
+                     font=fnb, anchor="w").pack(fill="x")
             sub = src if ok else f"🔒 {need}"
             if sub:
                 tk.Label(col, text=sub, bg=bg0, fg=P["muted"], font=fns, anchor="w").pack(fill="x")
@@ -6949,7 +7299,7 @@ def title_picker(app, entries, current, on_pick):
         for k, b in btns.items():
             b.configure(bg=P["accent"] if k == f else P["surface2"], fg="#ffffff" if k == f else P["text"])
         fill()
-    for f in ("Todos", "Desbloqueados", "Bloqueados", "Bronze", "Prata", "Ouro"):
+    for f in ("Todos", "Desbloqueados", "Bloqueados", "Bronze", "Prata", "Ouro", "Platina"):
         b = tk.Label(chips, text=f, bg=P["surface2"], fg=P["text"], font=fns, padx=px(10), pady=px(4), cursor="hand2")
         b.pack(side="left", padx=(0, px(6)))
         b.bind("<Button-1>", lambda e, f=f: setf(f))
@@ -6974,6 +7324,257 @@ def title_picker(app, entries, current, on_pick):
     top.update_idletasks()
     show()
     return top
+
+
+def _work_area():
+    """(esq, topo, dir, base) da área útil da tela, sem a barra de tarefas."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        r = wintypes.RECT()
+        ctypes.windll.user32.SystemParametersInfoW(0x30, 0, ctypes.byref(r), 0)
+        if r.right > r.left:
+            return r.left, r.top, r.right, r.bottom
+    except Exception:
+        log_error()
+    return None
+
+
+def popup_badge_pil(b, w, h):
+    """Cartão da conquista (estilo Steam), já em tamanho de tela. Cantos transparentes ficam com a cor-chave."""
+    plat = b["tier"] == "platina"
+    col = TIER_COLOR[b["tier"]]
+    rar = badge_rarity(b)
+    img = Image.new("RGBA", (w * K, h * K), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    body = mix(P["surface"], "#000000", .25)
+    if plat:                                          # moldura holográfica da platina
+        for x in range(w * K):
+            t_ = x / (w * K) * (len(PLAT_STOPS) - 1)
+            i_ = int(t_)
+            c_ = mix(PLAT_STOPS[i_], PLAT_STOPS[min(i_ + 1, len(PLAT_STOPS) - 1)], t_ - i_)
+            d.line([(x, 0), (x, h * K)], fill=c_)
+        m_ = Image.new("L", img.size, 0)
+        ImageDraw.Draw(m_).rounded_rectangle([0, 0, w * K - 1, h * K - 1], radius=16 * K, fill=255)
+        img.putalpha(m_)
+        d = ImageDraw.Draw(img)
+        d.rounded_rectangle([3 * K, 3 * K, w * K - 3 * K - 1, h * K - 3 * K - 1], radius=13 * K, fill=body)
+    else:
+        d.rounded_rectangle([0, 0, w * K - 1, h * K - 1], radius=16 * K, fill=col)
+        d.rounded_rectangle([2 * K, 2 * K, w * K - 2 * K - 1, h * K - 2 * K - 1], radius=14 * K, fill=body)
+    glow = Image.new("RGBA", img.size, (0, 0, 0, 0))                # brilho suave atrás da medalha
+    ImageDraw.Draw(glow).ellipse([-30 * K, -30 * K, 130 * K, (h + 30) * K], fill=hex_rgba(col, 60))
+    glow = glow.filter(ImageFilter.GaussianBlur(24 * K))
+    gm = Image.new("L", img.size, 0)
+    ImageDraw.Draw(gm).rounded_rectangle([3 * K, 3 * K, w * K - 3 * K - 1, h * K - 3 * K - 1], radius=13 * K, fill=255)
+    glow.putalpha(ImageChops.multiply(glow.getchannel("A"), gm))
+    img.alpha_composite(glow)
+    bs = 78
+    bi = badge_pil(b["icon"], b["tier"], True, bs * K)
+    img.alpha_composite(bi, (14 * K, int((h - bs) / 2 * K)))
+    d = ImageDraw.Draw(img)
+    x0 = 14 + bs + 14
+    T(d, x0, 14, "CONQUISTA DESBLOQUEADA", 9.5, col, True)
+    rw = TW(d, rar, 9.5, True) + 14
+    d.rounded_rectangle([(w - 14 - rw) * K, 12 * K, (w - 14) * K, 28 * K], radius=8 * K, fill=mix(col, body, .78))
+    T(d, w - 14 - rw / 2, 20, rar, 9.5, col, True, "mm")
+    ttl = _fit_text(d, b["title"], get_font(int(17 * K), True), (w - x0 - 16) * K)
+    T(d, x0, 34, ttl, 17, "#ffffff", True)
+    for n, ln in enumerate(wrap_l(b["desc"], 11.5, w - x0 - 16, maxlines=2)):
+        T(d, x0, 59 + n * 16, ln, 11.5, "#b9bdd6")
+    foot = f"Novo título: {b['ptitle']}"
+    T(d, x0, h - 20, ("✦ " if plat else "") + foot, 11, mix(col, "#ffffff", .35), True, "lm")
+    if plat:
+        for fx, fy, fr in ((w - 22, h - 20, 7), (w - 40, h - 30, 4)):
+            sparkle(d, fx * K, fy * K, fr * K, "#eaffff")
+    return img
+
+
+class BadgePopup(tk.Toplevel):
+    """Aviso de conquista por cima de tudo (como na Steam): aparece no canto da tela mesmo com o app em segundo plano,
+    sem roubar o foco do que você está fazendo."""
+    W, H = 440, 112
+
+    def __init__(self, app, b, on_done):
+        super().__init__(app)
+        self.app, self.b, self.on_done, self.closed = app, b, on_done, False
+        try:
+            self._build()
+        except Exception:
+            self.closed = True
+            try:
+                self.destroy()
+            except tk.TclError:
+                pass
+            raise
+
+    def _build(self):
+        app, b = self.app, self.b
+        self.withdraw()
+        self.overrideredirect(True)
+        key = "#010203"
+        try:
+            self.attributes("-transparentcolor", key)
+        except tk.TclError:
+            key = P["bg"]
+        self.configure(bg=key)
+        self.attributes("-topmost", True)
+        card = popup_badge_pil(b, self.W, self.H)
+        bg = Image.new("RGBA", card.size, key)
+        bg.alpha_composite(card)
+        self.w, self.h = px(self.W), px(self.H)
+        self.ph = ImageTk.PhotoImage(bg.convert("RGB").resize((self.w, self.h), Image.LANCZOS))
+        cv = tk.Canvas(self, width=self.w, height=self.h, bg=key, highlightthickness=0, bd=0, cursor="hand2")
+        cv.pack()
+        cv.create_image(0, 0, image=self.ph, anchor="nw")
+        cv.bind("<Button-1>", lambda e: self._click())
+        wa = _work_area() or (0, 0, self.winfo_screenwidth(), self.winfo_screenheight() - px(48))
+        self.x = wa[2] - self.w - px(18)
+        self.y = wa[3] - self.h - px(18)
+        self.geometry(f"{self.w}x{self.h}+{self.x}+{wa[3]}")
+        self.update_idletasks()
+        self._no_focus()
+        try:
+            self.attributes("-alpha", 0.0)
+        except tk.TclError:
+            pass
+        self.deiconify()
+        self.attributes("-topmost", True)
+        self.lift()
+        self._wa_bottom = wa[3]
+        self._steps = 14
+        self.after(10, lambda: self._anim(0, True))
+
+    def _no_focus(self):
+        try:                                           # Windows: não ativa, não aparece na barra de tarefas
+            import ctypes
+            u = ctypes.windll.user32
+            hwnd = u.GetParent(self.winfo_id()) or self.winfo_id()
+            st = u.GetWindowLongW(hwnd, -20)
+            u.SetWindowLongW(hwnd, -20, st | 0x08000000 | 0x00000080 | 0x00000008)
+        except Exception:
+            log_error()
+
+    def _anim(self, n, entering):
+        if self.closed:
+            return
+        try:
+            t = n / self._steps
+            e = 1 - (1 - t) ** 3
+            pos = e if entering else 1 - e
+            y = int(self._wa_bottom - (self._wa_bottom - self.y) * pos)
+            self.geometry(f"+{self.x}+{y}")
+            try:
+                self.attributes("-alpha", max(0.0, min(1.0, pos)))
+            except tk.TclError:
+                pass
+            if n < self._steps:
+                self.after(16, lambda: self._anim(n + 1, entering))
+            elif entering:
+                self.after(7000 if self.b["tier"] == "platina" else 5000, self.close)
+            else:
+                self._finish()
+        except tk.TclError:
+            self._finish()
+
+    def _click(self):
+        try:
+            self.app.deiconify()
+            self.app.lift()
+            self.app.focus_force()
+            self.app.open_sub(BadgesPage)
+        except Exception:
+            log_error()
+        self.close(now=True)
+
+    def close(self, now=False):
+        if self.closed:
+            return
+        if now:
+            self._finish()
+        else:
+            self._anim(0, False)
+
+    def _finish(self):
+        if self.closed:
+            return
+        self.closed = True
+        try:
+            self.destroy()
+        except tk.TclError:
+            pass
+        try:
+            self.on_done()
+        except Exception:
+            log_error()
+
+
+class QuoteBox(ctk.CTkFrame):
+    """Campo de texto de várias linhas (cresce até ~6 linhas) para colar citações longas. Mesma interface do entry:
+    get() e delete(0, "end")."""
+
+    def __init__(self, master, placeholder):
+        super().__init__(master, fg_color=P["surface2"], corner_radius=10, height=36)
+        self.ph, self.showing, self.on_submit = placeholder, False, None
+        self.tb = tk.Text(self, height=1, wrap="word", bg=P["surface2"], fg=P["text"], insertbackground=P["text"],
+                          relief="flat", bd=0, highlightthickness=0, font=("TkDefaultFont", fpt(11)), padx=px(10),
+                          pady=px(8), undo=True)
+        self.sb = tk.Scrollbar(self, orient="vertical", command=self.tb.yview)
+        self.tb.pack(side="left", fill="both", expand=True)
+        self.tb.bind("<FocusIn>", lambda e: self._focus(True))
+        self.tb.bind("<FocusOut>", lambda e: self._focus(False))
+        self.tb.bind("<KeyRelease>", lambda e: self._grow())
+        self.tb.bind("<<Paste>>", lambda e: self.after(20, self._grow), add="+")
+        self.tb.bind("<Return>", self._enter)
+        self.tb.bind("<Shift-Return>", lambda e: None)
+        self._show_ph()
+
+    def _show_ph(self):
+        if not self.tb.get("1.0", "end").strip():
+            self.tb.delete("1.0", "end")
+            self.tb.insert("1.0", self.ph)
+            self.tb.configure(fg=P["muted"])
+            self.showing = True
+
+    def _focus(self, on):
+        if on and self.showing:
+            self.tb.delete("1.0", "end")
+            self.tb.configure(fg=P["text"])
+            self.showing = False
+        elif not on:
+            self._show_ph()
+            self._grow()
+
+    def _enter(self, e):
+        if e.state & 0x1:                      # Shift: quebra de linha normal
+            return None
+        if self.on_submit:
+            self.on_submit()
+        return "break"
+
+    def _grow(self):
+        try:
+            n = self.tb.count("1.0", "end", "displaylines")
+            n = int(n[0] if isinstance(n, tuple) else n or 1)
+        except (tk.TclError, TypeError, ValueError):
+            n = int(self.tb.index("end-1c").split(".")[0])
+        n = max(1, min(6, n))
+        self.tb.configure(height=n)
+        if int(self.tb.index("end-1c").split(".")[0]) > 6 or n >= 6:
+            self.sb.pack(side="right", fill="y")
+        else:
+            self.sb.pack_forget()
+
+    def get(self):
+        return "" if self.showing else self.tb.get("1.0", "end").strip()
+
+    def delete(self, a=0, b="end"):
+        self.tb.delete("1.0", "end")
+        self.showing = False
+        if self.focus_get() is not self.tb:      # com o cursor dentro, fica vazio (não volta a dica por cima)
+            self._show_ph()
+        self.tb.configure(fg=P["text"] if not self.showing else P["muted"])
+        self._grow()
 
 
 class ProfileEditPage(Page):
@@ -7017,7 +7618,7 @@ class ProfileEditPage(Page):
         self.handle.pack(fill="x", padx=18)
         label("Título no perfil")
         self.title_map = {AUTO_TITLE: ""}
-        allb = badge_status(app)
+        allb = badge_status_cached(app)
         self._title_src = {b["id"]: b["title"] for b in allb}
         self._title_entries = [(AUTO_TITLE, "", "Mostra o título do seu nível de leitor", "", True, "")]
         for b in sorted([b for b in allb if b["earned"] or not b["secret"]],
@@ -7108,7 +7709,7 @@ class ProfileEditPage(Page):
         pr["bio"] = self.bio.get("1.0", "end").strip()
         pr["title"] = self.title_map.get(self.title_var.get(), "")
         profile_dir().mkdir(parents=True, exist_ok=True)
-        for key, box in (("avatar", (500, 500)), ("banner", (1800, 600))):
+        for key, box in (("avatar", (500, 500)), ("banner", (3200, 800))):
             if self.remove[key] and pr.get(key):
                 (profile_dir() / pr[key]).unlink(missing_ok=True)
                 pr[key] = ""
@@ -7117,7 +7718,7 @@ class ProfileEditPage(Page):
                 img = ImageOps.fit(img, box) if key == "avatar" else img
                 img.thumbnail(box)
                 pr[key] = f"{key}_{int(time.time())}.jpg"
-                img.save(profile_dir() / pr[key], quality=90)
+                img.save(profile_dir() / pr[key], quality=95 if key == "banner" else 90, subsampling=0)
         for f_ in profile_dir().glob("tmp_*.jpg"):
             f_.unlink(missing_ok=True)
         save_profile(pr)
@@ -7298,7 +7899,8 @@ class EditPage(Page):
     def save(self):
         old_seen = self.item["seen"] if self.item else None
         old = (dict(status=self.item["status"], rating=self.item["rating"], rereads=self.item["rereads"],
-                    ongoing=bool(self.item.get("ongoing"))) if self.item else None)
+                    ongoing=bool(self.item.get("ongoing")), auto_paused=bool(self.item.get("auto_paused")))
+               if self.item else None)
         title = self.name.get().strip()
         seen, total, rer = to_int(self.seen), to_int(self.total), to_int(self.rer)
         started, finished = self.started.get().strip(), self.finished.get().strip()
@@ -7324,6 +7926,9 @@ class EditPage(Page):
             total = seen          # em lançamento: saiu capítulo novo, o total acompanha
         if total and (status == "completo" or seen > total):
             seen = total
+        was_auto = bool(old and old.get("auto_paused") and status == old["status"])
+        if was_auto and status == "pausado" and self.ongoing.get() and total > seen:
+            status, was_auto = "lendo", False                  # saiu capítulo novo: volta a ser leitura em andamento
         it = self.item or {"id": uuid.uuid4().hex, "created": time.time(), "cover": None}
         it.update(title=title, type=self.type.get(), status=status, seen=seen, total=total,
                   rating=self.stars.value, author=self.author.get().strip(),
@@ -7333,7 +7938,7 @@ class EditPage(Page):
                   notes=self.notes.get("1.0", "end").strip(), updated=time.time(),
                   lists=[t.strip() for t in self.lists.get().split(",") if t.strip()],
                   vol_total=vt, vol_owned=owned, crit={k: st.value for k, st in self.crit.items()},
-                  ongoing=bool(self.ongoing.get()),
+                  ongoing=bool(self.ongoing.get()), auto_paused=was_auto,
                   labels=[t.strip() for t in self.labels.get().split(",") if t.strip()])
         for k, v in DEFAULTS.items():
             it.setdefault(k, fresh(v))
@@ -7370,6 +7975,7 @@ class EditPage(Page):
             img.thumbnail((500, 700))
             it["cover"] = f"{it['id']}.jpg"
             img.save(covers_dir() / it["cover"], quality=88)
+        unify_names(self.app.items if self.item else self.app.items + [it])
         if not self.item:
             self.app.items.append(it)
         self.app.commit(it["id"])
@@ -7377,13 +7983,14 @@ class EditPage(Page):
         self.app.go_back()
 
     def delete(self):
-        if messagebox.askyesno("Excluir", f"Excluir “{self.item['title']}”?", parent=self.app):
-            if self.item.get("cover"):
-                (covers_dir() / self.item["cover"]).unlink(missing_ok=True)
-            purge_shots(self.item)
-            self.app.items.remove(self.item)
-            self.app.commit(self.item["id"])
+        if messagebox.askyesno("Excluir", f"Excluir “{self.item['title']}”?\n(Ela vai para a lixeira em "
+                               "Configurações e pode ser restaurada por 30 dias.)", parent=self.app):
+            it = self.item
+            d = trash_item(it)
+            self.app.items.remove(it)
+            self.app.commit(it["id"])
             self.app.go_home()
+            self.app.toast(f"“{it['title']}” excluída", ms=9000, action=("Desfazer", lambda: self.app.restore_item(d)))
 
 
 # ---------- estatísticas ----------
@@ -7493,7 +8100,7 @@ class DetailPage(Page):
             try:
                 self.after_cancel(self._bd_job)
             except Exception:
-                pass
+                log_error()
         self._bd_job = self.after(70, lambda: self._bd_apply(cw))
 
     def _bd_apply(self, cw):
@@ -7527,7 +8134,7 @@ class DetailPage(Page):
             self.hero.configure(image=ctk.CTkImage(hero, size=(lw_, DETAIL_HERO)))
             self.hero._bd_img = None
         except Exception:
-            pass
+            log_error()
 
     def _layout(self, e):
         w = int(lw(e.width))
@@ -7541,7 +8148,7 @@ class DetailPage(Page):
             try:
                 lb.configure(wraplength=max(120, self._wrap - getattr(lb, "_wo", 0)))
             except Exception:
-                pass
+                log_error()
         self._arrange()
 
     def _arrange(self):
@@ -7572,7 +8179,7 @@ class DetailPage(Page):
             try:
                 w.destroy()
             except Exception:
-                pass
+                log_error()
 
     def _update_sd(self):
         sd = stalled_days(self.it)
@@ -7858,10 +8465,10 @@ class DetailPage(Page):
         ch.pack(side="left", padx=(0, 6))
         kind = menu(form, ["Citação", "Nota"], None, 96, fg=P["surface2"], height=36)
         kind.pack(side="left", padx=(0, 6))
-        txt = entry(form, "Escreva o trecho ou a anotação...")
+        txt = QuoteBox(form, "Escreva o trecho ou a anotação...  (Enter adiciona, Shift+Enter pula linha)")
         txt.pack(side="left", fill="x", expand=True, padx=(0, 6))
-        txt.bind("<Return>", lambda e: self.add_quote(ch, kind, txt), add="+")
-        accent_button(form, "Adicionar", lambda: self.add_quote(ch, kind, txt), width=92).pack(side="left")
+        txt.on_submit = lambda: self.add_quote(ch, kind, txt)
+        accent_button(form, "Adicionar", lambda: self.add_quote(ch, kind, txt), width=92).pack(side="left", anchor="s")
 
     def _fill_quotes(self):
         it, acc, host = self.it, self._qacc, self._qhost
@@ -7917,23 +8524,6 @@ class DetailPage(Page):
         except tk.TclError:
             pass
 
-    def _swap(self, attr, build):
-        """Troca um painel sem deixar buraco: o novo é montado fora da tela, entra no lugar e só então o antigo sai."""
-        old = getattr(self, attr)
-        new = ctk.CTkFrame(old.master, fg_color="transparent")
-        build(new)
-        new.pack(fill="x", after=old)
-        old.destroy()
-        setattr(self, attr, new)
-
-    def _refresh_hist(self):
-        self._hl = len(self.it.get("history", []))
-        return
-        try:
-            self._hl = len(self.it.get("history", []))
-            self._swap("hist_host", lambda h: self.history_panel(h, self._acc))
-        except Exception:
-            self.render()
 
     def del_quote(self, q):
         if q in self.it["quotes"]:
@@ -7942,108 +8532,13 @@ class DetailPage(Page):
             self._fill_quotes()
 
     # ---- histórico da obra (diário) ----
-    def _hist_row(self, tl, e):
-        base, col = EVENT_STYLE.get(e["kind"], (e["kind"], P["muted"]))
-        txt = e.get("text", "")
-        main = txt if e["kind"] == "note" else (base + (f" {txt}" if txt else ""))
-        row = ctk.CTkFrame(tl, fg_color="transparent")
-        ctk.CTkLabel(row, text="", image=icon("dot", 12, col), width=18).pack(side="left", anchor="n", pady=(4, 0))
-        t = ctk.CTkFrame(row, fg_color="transparent")
-        t.pack(side="left", fill="x", expand=True, padx=(6, 0))
-        self.wrapped(t, text=main, text_color=P["text"]).pack(anchor="w")
-        ctk.CTkLabel(t, text=datetime.fromtimestamp(e["ts"]).strftime("%d/%m/%Y · %H:%M"), text_color=P["muted"],
-                     font=ctk.CTkFont(size=11)).pack(anchor="w")
-        return row
 
-    def history_panel(self, rc, acc):
-        it = self.it
-        ev = sorted(it.get("history", []), key=lambda e: -e["ts"])
-        f, head = panel(rc, "Histórico")
-        f.pack(fill="x", pady=(14, 0))
-        count = ctk.CTkLabel(head, text=f"{len(ev)} registros", text_color=P["muted"], font=ctk.CTkFont(size=12))
-        count.pack(side="right")
-        form = ctk.CTkFrame(f, fg_color="transparent")
-        form.pack(fill="x", padx=16, pady=(0, 8))
-        ent = entry(form, "Escreva no diário desta leitura...")
-        ent.pack(side="left", fill="x", expand=True, padx=(0, 6))
-        ent.bind("<Return>", lambda e: self.add_diary(ent), add="+")
-        accent_button(form, "Registrar", lambda: self.add_diary(ent), width=92).pack(side="left")
-        hp = self._hp = {"f": f, "count": count, "tl": None, "empty": None, "more": None, "n": len(ev)}
-        if not ev:
-            hp["empty"] = self.wrapped(f, text="Nada registrado ainda. Início, pausas, notas e releituras aparecem aqui.",
-                                       text_color=P["muted"])
-            hp["empty"].pack(anchor="w", padx=16, pady=(0, 14))
-        else:
-            hp["tl"] = ctk.CTkFrame(f, fg_color="transparent")
-            hp["tl"].pack(fill="x", padx=16, pady=(0, 6))
-            for e in (ev if self.hist_all else ev[:8]):
-                self._hist_row(hp["tl"], e).pack(fill="x", pady=3)
-            if len(ev) > 8 and not self.hist_all:
-                hp["more"] = ghost_button(f, f"Mostrar todos ({len(ev)})", self.show_all_hist, height=30)
-                hp["more"].pack(anchor="w", padx=16, pady=(0, 14))
-            else:
-                hp["more"] = ctk.CTkFrame(f, width=1, height=8, fg_color="transparent")
-                hp["more"].pack()
 
     def _hist_sync(self):
         """O painel de histórico não é mais mostrado; os registros continuam sendo guardados."""
         self._hl = len(self.it.get("history", []))
         return
 
-    def _hist_sync_old(self):
-        hp = getattr(self, "_hp", None)
-        ev = sorted(self.it.get("history", []), key=lambda e: -e["ts"])
-        try:
-            n_new = len(ev) - hp["n"]
-            if hp is None or n_new < 0 or not hp["f"].winfo_exists():
-                return self._refresh_hist()
-            hp["count"].configure(text=f"{len(ev)} registros")
-            if n_new == 0:
-                return
-            if hp["tl"] is None:
-                if hp["empty"] is not None:
-                    hp["empty"].destroy()
-                    hp["empty"] = None
-                hp["tl"] = ctk.CTkFrame(hp["f"], fg_color="transparent")
-                hp["tl"].pack(fill="x", padx=16, pady=(0, 6))
-                hp["more"] = ctk.CTkFrame(hp["f"], width=1, height=8, fg_color="transparent")
-                hp["more"].pack()
-            tl = hp["tl"]
-            for e in reversed(ev[:n_new]):
-                kids = tl.winfo_children()
-                row = self._hist_row(tl, e)
-                if kids:
-                    row.pack(fill="x", pady=3, before=kids[0])
-                else:
-                    row.pack(fill="x", pady=3)
-            if not self.hist_all:
-                kids = tl.winfo_children()
-                for w in kids[8:]:
-                    w.destroy()
-                if len(ev) > 8 and not isinstance(hp["more"], ctk.CTkButton):
-                    if hp["more"] is not None:
-                        hp["more"].destroy()
-                    hp["more"] = ghost_button(hp["f"], f"Mostrar todos ({len(ev)})", self.show_all_hist, height=30)
-                    hp["more"].pack(anchor="w", padx=16, pady=(0, 14))
-                elif isinstance(hp["more"], ctk.CTkButton):
-                    hp["more"].configure(text=f"Mostrar todos ({len(ev)})")
-            hp["n"] = len(ev)
-            self._hl = len(ev)
-        except Exception:
-            self._refresh_hist()
-
-    def show_all_hist(self):
-        self.hist_all = True
-        self.render()
-
-    def add_diary(self, ent):
-        text = ent.get().strip()
-        if text:
-            add_event(self.it, "note", text)
-            self.it["updated"] = time.time()
-            self.app.commit(self.it["id"])
-            ent.delete(0, "end")
-            self._hist_sync()
 
     def show_vols(self):
         n = len(self.it["vol_owned"])
@@ -8178,7 +8673,7 @@ class DetailPage(Page):
             if not running:
                 self.timer_lbl.configure(text="00:00:00")
         except Exception:
-            pass
+            log_error()
 
     def toggle_timer(self):
         """Liga/desliga o cronômetro mexendo só no botão e nos textos (sem refazer a tela)."""
@@ -8219,6 +8714,7 @@ class DetailPage(Page):
         ev = status_event(old, new)
         sig = self._sig()
         it["status"] = new
+        it["auto_paused"] = False
         if new == "lendo":
             it["started"] = it["started"] or today
         if new == "completo":
@@ -8237,7 +8733,7 @@ class DetailPage(Page):
             return
         t = self.app.timer
         if t and t["id"] == self.it["id"] and self.timer_lbl is not None:
-            e = int(time.time() - t["start"])
+            e = timer_secs(t)
             self.timer_lbl.configure(text=f"{e // 3600:02d}:{e % 3600 // 60:02d}:{e % 60:02d}")
         self.after(1000, self.tick)
 
@@ -8248,7 +8744,7 @@ class BadgesPage(ImgPage):
 
     def __init__(self, app):
         self.filter, self.cat = "Todas", "Todas"
-        self.st = badge_status(app)
+        self.st = badge_status_cached(app)
         super().__init__(app, "Conquistas", back=True)
 
     # ---- dados: conquistas com etapas viram um cartão só ----
@@ -8280,7 +8776,7 @@ class BadgesPage(ImgPage):
         return ents
 
     def _lists(self):
-        rank = {"ouro": 0, "prata": 1, "bronze": 2}
+        rank = {"platina": -1, "ouro": 0, "prata": 1, "bronze": 2}
         out = []
         for e in self._entries():
             if self.cat != "Todas" and e["cat"] != self.cat:
@@ -8318,7 +8814,7 @@ class BadgesPage(ImgPage):
                 d.rounded_rectangle([20 * K, 52 * K, (20 + bw * got / max(1, len(vis))) * K, 60 * K], radius=4 * K,
                                     fill=P["accent"])
             x = 20
-            for tier in ("bronze", "prata", "ouro"):
+            for tier in ("bronze", "prata", "ouro", "platina"):
                 tv = [b for b in vis if b["tier"] == tier]
                 tg = sum(1 for b in tv if b["earned"])
                 bi = badge_pil("star", tier, True, 26 * K)
@@ -8479,84 +8975,780 @@ class BadgesPage(ImgPage):
         return out
 
 
-class YearReviewPage(Page):
-    MAXW = 900
+# ---------- Retrospectiva do ano (tela em imagem, com hover, comparação e cartão para compartilhar) ----------
+def review_stats(app, y):
+    """Números de um ano (usado na tela, na comparação com o ano anterior e no cartão de compartilhar)."""
+    items, act = app.items, app.activity
+    pre = str(y)
+    done = [i for i in items if i["status"] == "completo" and year_of(i["finished"]) == y]
+    ch_m = [sum_activity(act, f"{y:04d}-{m:02d}", "ch") for m in range(1, 13)]
+    mn_m = [sum_activity(act, f"{y:04d}-{m:02d}", "min") for m in range(1, 13)]
+    rated = [i["rating"] for i in done if i["rating"]]
+    ya = {k: v for k, v in act.items() if k.startswith(pre)}
+    best_m = max(range(12), key=lambda n: ch_m[n]) if any(ch_m) else None
+    badges = sorted([b for b in badge_status_cached(app) if b["earned"] and (b.get("date") or "").startswith(pre)],
+                    key=lambda b: b["date"])
+    return dict(
+        year=y, done=done, ch_m=ch_m, mn_m=mn_m, chapters=sum(ch_m), mins=sum(mn_m),
+        avg=(sum(rated) / len(rated)) if rated else 0.0, genres=Counter(t for i in done for t in i["tags"]),
+        types=Counter(i["type"] for i in done), longest=streaks(ya)[1],
+        adays=sum(1 for v in ya.values() if v.get("ch", 0) > 0 or v.get("min", 0) > 0),
+        top=sorted(done, key=lambda i: (-i["rating"], -i["seen"]))[:5], best_m=best_m, badges=badges)
+
+
+def _rv_empty(st):
+    return not st["done"] and not st["chapters"] and not st["mins"]
+
+
+def _delta(cur, prev, fmt=None, dec=False):
+    """(texto, cor, sentido) da variação em relação ao ano anterior. sentido: 1 sobe, -1 desce, 0 igual."""
+    fmt = fmt or (lambda v: f"{v:g}")
+    if not prev and not cur:
+        return "", P["muted"], 0
+    if not prev:
+        return "novo", P["accent"], 0
+    diff = cur - prev
+    if abs(diff) < (0.05 if dec else 0.5):
+        return "igual", P["muted"], 0
+    txt = fmt(abs(round(diff, 1) if dec else diff))
+    return txt, ("#4ade80" if diff > 0 else "#f87171"), (1 if diff > 0 else -1)
+
+
+def _tri(d, x, y, up, col, s=5):
+    pts = [(x - s, y + s / 2), (x + s, y + s / 2), (x, y - s / 2 - 1)] if up else \
+          [(x - s, y - s / 2), (x + s, y - s / 2), (x, y + s / 2 + 1)]
+    d.polygon([(a * K, b * K) for a, b in pts], fill=col)
+
+
+def _fmt_avg(v):
+    return f"{v:.1f}".replace(".", ",") if v else "–"
+
+
+RV_HERO_H = 300
+
+
+def spec_rv_hero(app, page, st, pst):
+    y = st["year"]
+    top = st["top"]
+    years = [x for x in {yy for i in app.items for yy in (year_of(i["finished"]), year_of(i["started"])) if yy}]
+    ymin = min(years + [date.today().year])
+    ymax = date.today().year
+    best = top[0] if top else None
+    stats = [(len(st["done"]), "completas", _delta(len(st["done"]), len(pst["done"]))),
+             (st["chapters"], "capítulos lidos", _delta(st["chapters"], pst["chapters"])),
+             (fmt_minutes(st["mins"]), "de leitura",
+              _delta(st["mins"], pst["mins"], lambda v: fmt_minutes(v))),
+             (_fmt_avg(st["avg"]), "nota média", _delta(st["avg"], pst["avg"], lambda v: f"{v:g}".replace(".", ","), True))]
+    cache = {}
+
+    def bg_for(W, H):
+        if "bg" in cache and cache["bg"].size == (W * K, H * K):
+            return cache["bg"].copy()
+        acc = P["accent"]
+        if best is not None:
+            cov = app._load_cover(best).convert("RGB")
+            small = ImageOps.fit(cov, (max(16, W // 10), max(16, H // 10)), centering=(0.5, 0.3)).filter(
+                ImageFilter.GaussianBlur(3))
+            base = small.resize((W * K, H * K), Image.BICUBIC)
+            base = Image.blend(base, Image.new("RGB", base.size, acc), .30)
+        else:
+            base = Image.new("RGB", (W * K, H * K), mix(acc, P["bg"], .55))
+        base = Image.blend(base, Image.new("RGB", base.size, P["bg"]), .42)
+        sh = Image.new("L", (W * K, 1))                     # escurece da esquerda p/ a direita (texto legível)
+        for x in range(W * K):
+            sh.putpixel((x, 0), int(170 * max(0.0, 1 - x / (W * K * .85)) ** 1.2))
+        base = Image.composite(Image.new("RGB", base.size, P["bg"]), base, sh.resize(base.size))
+        cache["bg"] = base.convert("RGBA")
+        return cache["bg"].copy()
+
+    def geom(W):
+        show_cov = best is not None and W >= 700
+        cw = 128 if show_cov else 0
+        return show_cov, cw, 130, W - 24 - cw
+
+    def draw(W, H, hov):
+        img = bg_for(W, H)
+        d = ImageDraw.Draw(img)
+        acc = P["accent"]
+        show_cov, cw, ch, _r = geom(W)
+        # seletor de ano
+        T(d, 30, 34, "RETROSPECTIVA", 13, mix(acc, "#ffffff", .55), True, "lm")
+        for nm, px0, ok in (("prev", 30, y > ymin), ("next", 30 + 34 + 110, y < ymax)):
+            col = P["surface2"] if (hov == nm and ok) else mix(P["surface"], P["bg"], .35)
+            d.rounded_rectangle([px0 * K, 52 * K, (px0 + 34) * K, 86 * K], radius=17 * K, fill=col,
+                                outline=P["border"], width=K)
+            cx_, cy_ = px0 + 17, 69
+            a_ = 6 if nm == "next" else -6
+            d.line([((cx_ - a_ / 2) * K, (cy_ - 7) * K), ((cx_ + a_ / 2) * K, cy_ * K), ((cx_ - a_ / 2) * K, (cy_ + 7) * K)],
+                   fill="#ffffff" if ok else P["muted"], width=2 * K, joint="curve")
+        T(d, 30 + 34 + 55, 69, str(y), 30, "#ffffff", True, "mm")
+        T(d, 30 + 34 + 110 + 34 + 16, 70, "em leituras", 20, mix(acc, "#ffffff", .6), True, "lm")
+        # botão compartilhar
+        lab = "Compartilhar"
+        bw = TW(d, lab, 14, True) + 56
+        x1 = W - 24
+        x0 = x1 - bw
+        d.rounded_rectangle([x0 * K, 28 * K, x1 * K, 68 * K], radius=20 * K,
+                            fill=P["accent_hover"] if hov == "share" else acc)
+        paste_ico(img, "share", 16, "#ffffff", x0 + 16, 40)
+        d = ImageDraw.Draw(img)
+        T(d, x0 + 40, 48, lab, 14, "#ffffff", True, "lm")
+        # obra do ano
+        if show_cov:
+            cx0, cy0 = W - 24 - cw, 100
+            cov = app.cover_pil(best, cw, ch)
+            lift = 5 if hov == "best" else 0
+            sh = Image.new("RGBA", img.size, (0, 0, 0, 0))
+            ImageDraw.Draw(sh).rounded_rectangle([cx0 * K, (cy0 + 10 - lift) * K, (cx0 + cw) * K, (cy0 + ch + 12 - lift) * K],
+                                                 radius=14 * K, fill=(0, 0, 0, 150))
+            img = Image.alpha_composite(img, sh.filter(ImageFilter.GaussianBlur(10)))
+            img.alpha_composite(cov, (cx0 * K, (cy0 - lift) * K))
+            d = ImageDraw.Draw(img)
+            d.rounded_rectangle([cx0 * K, (cy0 - lift) * K, (cx0 + cw) * K, (cy0 + ch - lift) * K], radius=int(cw * .16) * K,
+                                outline=GOLD_HEX if hov == "best" else mix(acc, "#ffffff", .3), width=2 * K)
+            T(d, cx0 + cw / 2, cy0 + ch + 16, "Obra do ano", 12, GOLD_HEX, True, "mm")
+        # números
+        left_w = geom(W)[3] - 30 - (20 if show_cov else 0)
+        n = len(stats)
+        colw = left_w / n
+        big = 36 if colw >= 150 else 28
+        for k_, (v, lab, (dt, dc, ds)) in enumerate(stats):
+            x = 30 + k_ * colw
+            T(d, x, 168, v, big, "#ffffff", True, "lm")
+            T(d, x, 168 + big * .75 + 6, lab, 13, mix(acc, "#ffffff", .65), False, "lm")
+            if dt:
+                yy = 168 + big * .75 + 30
+                if ds:
+                    _tri(d, x + 6, yy, ds > 0, dc)
+                    T(d, x + 16, yy, f"{dt} vs {y - 1}", 12, dc, True, "lm")
+                else:
+                    T(d, x, yy, dt if dt != "novo" else f"novo em {y}", 12, dc, True, "lm")
+        # recorte arredondado
+        m = Image.new("L", img.size, 0)
+        ImageDraw.Draw(m).rounded_rectangle([0, 0, img.width - 1, img.height - 1], radius=18 * K, fill=255)
+        out = Image.new("RGBA", img.size, (0, 0, 0, 0))
+        out.paste(img, (0, 0), m)
+        ImageDraw.Draw(out).rounded_rectangle([0, 0, out.width - 1, out.height - 1], radius=18 * K, outline=P["border"],
+                                               width=K)
+        return out
+
+    def block(key, x, yy, W):
+        H = RV_HERO_H
+        show_cov, cw, ch, _r = geom(W)
+        bw = TW(ImageDraw.Draw(Image.new("RGB", (4, 4))), "Compartilhar", 14, True) + 56
+        regs = [(30, 52, 64, 86, "prev"), (30 + 34 + 110, 52, 30 + 34 + 110 + 34, 86, "next"),
+                (W - 24 - bw, 28, W - 24, 68, "share")]
+        if show_cov:
+            regs.append((W - 24 - cw, 100, W - 24, 100 + ch, "best"))
+
+        def act(name):
+            if name == "prev" and y > ymin:
+                page.set_year(y - 1)
+            elif name == "next" and y < ymax:
+                page.set_year(y + 1)
+            elif name == "share":
+                page.share()
+            elif name == "best" and best is not None:
+                app.open_detail(best)
+        blk = Blk(key, x, yy, W, H, lambda hov: draw(W, H, hov), regs, act)
+        blk.item = lambda name: best if name == "best" else None
+        return blk
+    return block
+
+
+def spec_rv_empty(y):
+    msg = (f"Nada registrado em {y} ainda. Complete leituras e use o +1 capítulo ou o cronômetro "
+           "para alimentar a retrospectiva.")
+
+    def body(img, d, w, h, hov):
+        for n_, line in enumerate(wrap_l(msg, 14, w - 32)):
+            T(d, 16, HEAD + n_ * 20, line, 14, P["muted"])
+    return PanelSpec("Sem dados", lambda w: HEAD + len(wrap_l(msg, 14, w - 32)) * 20 + 18, body)
+
+
+def spec_rv_best(app, st):
+    top = st["top"]
+
+    def geo(w):
+        n = len(top)
+        avail = w - 32
+        cw = int(min(176, (avail - 16 * (n - 1)) / n))
+        ch = int(cw * 1.45)
+        gap = (avail - n * cw) / (n + 1)
+        return cw, ch, gap
+
+    def nat(w):
+        cw, ch, gap = geo(w)
+        return HEAD + 10 + ch + 14 + 52 + 12
+
+    def body(img, d, w, h, hov):
+        cw, ch, gap = geo(w)
+        hi_ = int(hov[2:]) if isinstance(hov, str) and hov.startswith("w:") else None
+        for n_, it in enumerate(top):
+            x = 16 + gap + n_ * (cw + gap)
+            lift = 7 if hi_ == n_ else 0
+            y = HEAD + 10 - lift
+            cov = app.cover_pil(it, cw, ch)
+            if hi_ == n_:
+                glow = Image.new("RGBA", img.size, (0, 0, 0, 0))
+                ImageDraw.Draw(glow).rounded_rectangle([(x - 3) * K, (y - 3) * K, (x + cw + 3) * K, (y + ch + 3) * K],
+                                                       radius=16 * K, fill=hex_rgba(P["accent"], 150))
+                img.alpha_composite(glow.filter(ImageFilter.GaussianBlur(9)))
+            img.alpha_composite(cov, (int(x * K), int(y * K)))
+            d = ImageDraw.Draw(img)
+            d.rounded_rectangle([x * K, y * K, (x + cw) * K, (y + ch) * K], radius=int(cw * .16) * K,
+                                outline=GOLD_HEX if n_ == 0 else (P["accent"] if hi_ == n_ else P["border"]),
+                                width=2 * K if (n_ == 0 or hi_ == n_) else K)
+            rc = GOLD_HEX if n_ == 0 else mix(P["accent"], "#ffffff", .15)
+            d.ellipse([(x + 8) * K, (y + 8) * K, (x + 36) * K, (y + 36) * K], fill=rc)
+            T(d, x + 22, y + 22, str(n_ + 1), 15, "#1a1206" if n_ == 0 else "#ffffff", True, "mm")
+            ty = HEAD + 10 + ch + 14
+            for k_, line in enumerate(wrap_l(it["title"], 12, cw, True, 2)):
+                T(d, x + cw / 2, ty + k_ * 15, line, 12, P["text"] if hi_ == n_ else P["text"], True, "mt")
+            if it["rating"]:
+                s = f"{it['rating']:.1f}".replace(".", ",")
+                tw_ = TW(d, s, 13, True)
+                sx = x + cw / 2 - (tw_ + 18) / 2
+                paste_star(img, 13, sx, ty + 33)
+                d = ImageDraw.Draw(img)
+                T(d, sx + 18, ty + 40, s, 13, GOLD_HEX, True, "lm")
+
+    def regs(w, h):
+        cw, ch, gap = geo(w)
+        return [(16 + gap + n_ * (cw + gap) - 4, HEAD + 2, 16 + gap + n_ * (cw + gap) + cw + 4, HEAD + 10 + ch + 66,
+                 f"w:{n_}") for n_ in range(len(top))]
+    sp = PanelSpec("Melhores leituras do ano", nat, body, regs=regs, act=lambda n: app.open_detail(top[int(n[2:])]))
+    return sp
+
+
+def spec_rv_months(st, pst):
+    y = st["year"]
+    data = [(MESES[n], v) for n, v in enumerate(st["ch_m"])]
+    show_prev = any(pst["ch_m"])
+    tips_ = []
+    for n, v in enumerate(st["ch_m"]):
+        t = f"{MESES_LONGOS[n].capitalize()} · {v} {'capítulo' if v == 1 else 'capítulos'}"
+        if show_prev:
+            t += f"  (em {y - 1}: {pst['ch_m'][n]})"
+        tips_.append(t)
+    return PanelSpec(f"Capítulos por mês em {y}", lambda w: HEAD + 170 + 14,
+                     lambda img, d, w, h, hov: c_line(d, 16, HEAD, w - 32, 170, data, hov, tips_),
+                     regs=lambda w, h: line_regs(16, HEAD, w - 32, 170, 12))
+
+
+def spec_rv_hours(st):
+    data = [(MESES[n], round(v / 60, 1)) for n, v in enumerate(st["mn_m"])]
+    tips_ = [f"{MESES_LONGOS[n].capitalize()} · {fmt_minutes(v) if v else 'sem leitura cronometrada'}"
+             for n, v in enumerate(st["mn_m"])]
+    return PanelSpec("Horas de leitura por mês", lambda w: HEAD + 150 + 14,
+                     lambda img, d, w, h, hov: c_bars(d, 16, HEAD, w - 32, max(150, h - HEAD - 14), data, None, hov, img,
+                                                      tips_),
+                     regs=lambda w, h: bar_regs(16, HEAD, w - 32, max(150, h - HEAD - 14), 12))
+
+
+def spec_rv_compare(st, pst):
+    y = st["year"]
+    rows = [("Completas", len(st["done"]), len(pst["done"]), None, False),
+            ("Capítulos lidos", st["chapters"], pst["chapters"], None, False),
+            ("Tempo de leitura", st["mins"], pst["mins"], fmt_minutes, False),
+            ("Nota média", st["avg"], pst["avg"], _fmt_avg, True),
+            ("Dias de leitura", st["adays"], pst["adays"], None, False),
+            ("Maior sequência", st["longest"], pst["longest"], lambda v: f"{int(v)} d", False)]
+    RH = 50
+
+    def body(img, d, w, h, hov):
+        hi_ = hidx(hov)
+        for k_, (lab, cur, prev, fmt, dec) in enumerate(rows):
+            yy = HEAD + k_ * RH
+            if hi_ == k_:
+                d.rounded_rectangle([8 * K, (yy - 2) * K, (w - 8) * K, (yy + RH - 4) * K], radius=9 * K, fill=P["surface2"])
+            f = fmt or (lambda v: f"{v:g}")
+            T(d, 18, yy + 8, lab, 13, P["text"] if hi_ == k_ else P["muted"], hi_ == k_, "lm")
+            dt, dc, ds = _delta(cur, prev, fmt, dec)
+            if dt:
+                tw_ = TW(d, dt, 12, True)
+                if ds:
+                    T(d, w - 18, yy + 8, dt, 12, dc, True, "rm")
+                    _tri(d, w - 18 - tw_ - 10, yy + 8, ds > 0, dc)
+                else:
+                    T(d, w - 18, yy + 8, dt, 12, dc, True, "rm")
+            mx = max(cur, prev, 0.0001)
+            bx0, bw_ = 18, w - 36 - 70
+            for j, (v, col, lh) in enumerate(((cur, P["accent"], 9), (prev, mix(P["muted"], P["surface"], .55), 6))):
+                by = yy + 22 + j * 12
+                d.rounded_rectangle([bx0 * K, by * K, (bx0 + bw_) * K, (by + lh) * K], radius=3 * K,
+                                    fill=mix(P["surface2"], P["surface"], .5) if hi_ != k_ else P["surface"])
+                if v:
+                    d.rounded_rectangle([bx0 * K, by * K, (bx0 + max(4, bw_ * v / mx)) * K, (by + lh) * K], radius=3 * K,
+                                        fill=col)
+                T(d, bx0 + bw_ + 10, by + lh / 2, f(v) if v else "–", 12 if j == 0 else 11,
+                  P["text"] if j == 0 else P["muted"], j == 0, "lm")
+        T(d, 18, HEAD + len(rows) * RH + 6, f"Barra roxa: {y}  ·  barra cinza: {y - 1}", 11, P["muted"])
+    return PanelSpec(f"{y} comparado a {y - 1}", lambda w: HEAD + len(rows) * RH + 30, body,
+                     regs=lambda w, h: [(8, HEAD + k_ * RH - 2, w - 8, HEAD + k_ * RH + RH - 4, f"tip:{k_}")
+                                        for k_ in range(len(rows))])
+
+
+def spec_rv_genres(st):
+    top = st["genres"].most_common(6)
+    if not top:
+        msg = "Cadastre gêneros nas leituras completas do ano para ver este ranking."
+        return PanelSpec("Gêneros mais lidos", lambda w: HEAD + 40,
+                         lambda img, d, w, h, hov: T(d, 16, HEAD, msg, 13, P["muted"]))
+    mx, tot = top[0][1], sum(st["genres"].values())
+    RH = 34
+
+    def body(img, d, w, h, hov):
+        hi_ = hidx(hov)
+        lw_ = 118
+        for k_, (g, n) in enumerate(top):
+            yy = HEAD + k_ * RH
+            hot = hi_ == k_
+            if hot:
+                d.rounded_rectangle([8 * K, (yy - 3) * K, (w - 8) * K, (yy + RH - 5) * K], radius=9 * K, fill=P["surface2"])
+            T(d, 18, yy + 12, wrap_l(g, 13, lw_ - 8, hot, 1)[0] if g else "", 13, P["text"] if hot else P["muted"], hot, "lm")
+            bx0, bw_ = 18 + lw_, w - 36 - lw_ - 44
+            d.rounded_rectangle([bx0 * K, (yy + 6) * K, (bx0 + bw_) * K, (yy + 18) * K], radius=5 * K,
+                                fill=P["surface2"] if not hot else P["surface"])
+            fw = max(8, bw_ * n / mx)
+            col = mix(P["accent"], "#ffffff", .22) if hot else (P["accent"] if k_ else mix(P["accent"], "#ffffff", .1))
+            d.rounded_rectangle([bx0 * K, (yy + 6) * K, (bx0 + fw) * K, (yy + 18) * K], radius=5 * K, fill=col)
+            T(d, w - 18, yy + 12, n, 13, P["text"], hot, "rm")
+            if hot:
+                tip_bubble(d, bx0 + fw, yy + 6, f"{g} · {n} {'obra' if n == 1 else 'obras'} ({round(100 * n / tot)}%)", w)
+    return PanelSpec("Gêneros mais lidos", lambda w: HEAD + len(top) * RH + 10, body,
+                     regs=lambda w, h: [(8, HEAD + k_ * RH - 3, w - 8, HEAD + k_ * RH + RH - 5, f"tip:{k_}")
+                                        for k_ in range(len(top))])
+
+
+def spec_rv_types(st):
+    data = [(t, st["types"][t], type_color(t)) for t in TYPES if st["types"].get(t)]
+    if not data:
+        return PanelSpec("Tipos lidos", lambda w: HEAD + 40,
+                         lambda img, d, w, h, hov: T(d, 16, HEAD, "Nenhuma leitura completa neste ano.", 13, P["muted"]))
+    return PanelSpec("Tipos lidos", lambda w: HEAD + 190 + 14,
+                     lambda img, d, w, h, hov: c_donut(d, 16, HEAD, w - 32, 190, data, hov),
+                     regs=lambda w, h: donut_regs(16, HEAD, w - 32, 190, len(data)))
+
+
+def rv_facts(st):
+    g, t = st["genres"].most_common(1), st["types"].most_common(1)
+    bm = st["best_m"]
+    longest_done = max(st["done"], key=lambda i: max(i["total"], i["seen"]), default=None)
+    return [("book", "Gênero mais lido", g[0][0] if g else "–", f"{g[0][1]} obras" if g else ""),
+            ("play", "Tipo mais lido", t[0][0] if t else "–", f"{t[0][1]} obras" if t else ""),
+            ("chart", "Mês mais ativo", MESES_LONGOS[bm].capitalize() if bm is not None else "–",
+             f"{st['ch_m'][bm]} capítulos" if bm is not None else ""),
+            ("flag", "Maior sequência", f"{st['longest']} dias" if st["longest"] else "–", "lendo todo dia"),
+            ("clock", "Dias de leitura", str(st["adays"]), "com atividade"),
+            ("trophy", "Maior leitura concluída", longest_done["title"] if longest_done else "–",
+             f"{max(longest_done['total'], longest_done['seen'])} capítulos" if longest_done else "")]
+
+
+def spec_rv_facts(st):
+    facts = rv_facts(st)
+
+    def geo(w):
+        cols = 3 if w >= 640 else 2
+        return cols, (w - 32 - 12 * (cols - 1)) / cols
+
+    def nat(w):
+        cols, _cw = geo(w)
+        return HEAD + ((len(facts) + cols - 1) // cols) * 84 + 8
+
+    def body(img, d, w, h, hov):
+        cols, cw = geo(w)
+        hi_ = hidx(hov)
+        for k_, (ic, lab, val, sub) in enumerate(facts):
+            x, y = 16 + (k_ % cols) * (cw + 12), HEAD + (k_ // cols) * 84
+            hot = hi_ == k_
+            d.rounded_rectangle([x * K, y * K, (x + cw) * K, (y + 72) * K], radius=12 * K,
+                                fill=P["surface2"] if hot else mix(P["surface2"], P["surface"], .5),
+                                outline=P["accent"] if hot else P["border"], width=K)
+            paste_ico(img, ic, 20, P["accent"] if hot else P["muted"], x + 14, y + 14)
+            d = ImageDraw.Draw(img)
+            T(d, x + 44, y + 17, lab, 12, P["muted"], False, "lm")
+            T(d, x + 14, y + 42, wrap_l(val, 17, cw - 28, True, 1)[0], 17, P["text"], True, "lm")
+            if sub:
+                T(d, x + 14, y + 61, sub, 11, P["muted"], False, "lm")
+
+    def regs(w, h):
+        cols, cw = geo(w)
+        return [(16 + (k_ % cols) * (cw + 12), HEAD + (k_ // cols) * 84, 16 + (k_ % cols) * (cw + 12) + cw,
+                 HEAD + (k_ // cols) * 84 + 72, f"tip:{k_}") for k_ in range(len(facts))]
+    return PanelSpec("Em destaque", nat, body, regs=regs)
+
+
+def spec_rv_badges(st):
+    bl = st["badges"]
+    y = st["year"]
+    if not bl:
+        msg = f"Nenhuma conquista liberada em {y}."
+        return PanelSpec("Conquistas do ano", lambda w: HEAD + 40,
+                         lambda img, d, w, h, hov: T(d, 16, HEAD, msg, 13, P["muted"]))
+    shown = bl[:18]
+
+    def geo(w):
+        cols = max(1, int((w - 32) // 230))
+        return cols, (w - 32) / cols
+
+    def nat(w):
+        cols, _cw = geo(w)
+        return HEAD + ((len(shown) + cols - 1) // cols) * 58 + (26 if len(bl) > len(shown) else 4) + 8
+
+    def head(img, d, w):
+        T(d, w - 16, 24, f"{len(bl)} {'conquista' if len(bl) == 1 else 'conquistas'}", 12, P["muted"], False, "rm")
+
+    def body(img, d, w, h, hov):
+        cols, cw = geo(w)
+        hi_ = hidx(hov)
+        for k_, b in enumerate(shown):
+            x, yy = 16 + (k_ % cols) * cw, HEAD + (k_ // cols) * 58
+            col = TIER_COLOR.get(b["tier"], P["accent"])
+            hot = hi_ == k_
+            if hot:
+                d.rounded_rectangle([(x + 2) * K, yy * K, (x + cw - 2) * K, (yy + 52) * K], radius=12 * K, fill=P["surface2"])
+            d.ellipse([(x + 10) * K, (yy + 7) * K, (x + 48) * K, (yy + 45) * K], fill=mix(col, P["surface"], .78),
+                      outline=col, width=2 * K)
+            paste_ico(img, b["icon"], 20, col, x + 19, yy + 16)
+            d = ImageDraw.Draw(img)
+            T(d, x + 58, yy + 18, wrap_l(b["title"], 13, cw - 70, True, 1)[0], 13, P["text"], True, "lm")
+            T(d, x + 58, yy + 36, (fmt_badge_date(b["date"]) or "") + f" · {b['tier']}", 11, col if hot else P["muted"],
+              False, "lm")
+        if len(bl) > len(shown):
+            T(d, 18, h - 22, f"+{len(bl) - len(shown)} outras conquistas — veja todas na aba Conquistas.", 12, P["muted"])
+
+    def regs(w, h):
+        cols, cw = geo(w)
+        return [(16 + (k_ % cols) * cw + 2, HEAD + (k_ // cols) * 58, 16 + (k_ % cols) * cw + cw - 2,
+                 HEAD + (k_ // cols) * 58 + 52, f"tip:{k_}") for k_ in range(len(shown))]
+    return PanelSpec("Conquistas do ano", nat, body, head=head, regs=regs)
+
+
+def _library_bg(W, H, accent, seed=7):
+    """Fundo "biblioteca à luz de lampiões" desenhado por código (usado quando o perfil não tem banner)."""
+    rnd = random.Random(seed)
+    ac = hex_rgba(accent, 255)[:3]
+    img = Image.new("RGB", (W, H), "#0a0814")
+    d = ImageDraw.Draw(img)
+    for side in (0, 1):                                   # estantes nas duas laterais
+        for row in range(0, H, 190):
+            x = 0 if side == 0 else W - 190
+            xx = x
+            while xx < x + 190:
+                bw = rnd.randint(14, 30)
+                bh = rnd.randint(110, 168)
+                col = mix(rnd.choice([accent, "#6b3a2a", "#2d4a6b", "#4a2d6b", "#7a5a2a"]), "#08060f", rnd.uniform(.45, .8))
+                d.rectangle([xx, row + 176 - bh, xx + bw, row + 176], fill=col)
+                xx += bw + 1
+            d.rectangle([x, row + 176, x + 190, row + 190], fill="#120d1c")
+    img = img.filter(ImageFilter.GaussianBlur(5))
+    glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    gd = ImageDraw.Draw(glow)
+    for cx, cy, r, col in ((90, 330, 150, (255, 170, 70)), (W - 80, 300, 130, (255, 190, 90)),
+                           (W // 2, 80, 360, ac), (W // 2, H - 150, 420, ac), (60, H - 420, 160, (255, 160, 60))):
+        gd.ellipse([cx - r, cy - r, cx + r, cy + r], fill=col + (95,))
+    img = Image.alpha_composite(img.convert("RGBA"), glow.filter(ImageFilter.GaussianBlur(70)))
+    return img.convert("RGB")
+
+
+def make_year_card(app, st, path):
+    """Cartão do ano (1080x1620): fundo do banner (ou biblioteca desenhada), perfil, números, gêneros,
+    melhores leituras e curiosidades em painéis translúcidos."""
+    W, H = 1080, 1650
+    y = st["year"]
+    pr, accent = app.profile, S["accent"]
+    ac = hex_rgba(accent, 255)[:3]
+    navy = "#0a0c18"
+    soft = mix(accent, "#ffffff", .62)
+    bp = profile_dir() / pr["banner"] if pr.get("banner") else None
+    try:
+        raw = Image.open(bp).convert("RGB") if bp and bp.exists() else None
+    except OSError:
+        raw = None
+    if raw is None:
+        back = _library_bg(W, H, accent)
+    else:
+        back = ImageOps.fit(raw, (W, H)).filter(ImageFilter.GaussianBlur(24))
+        back = Image.blend(back, Image.new("RGB", (W, H), navy), .58)
+        topb = ImageOps.fit(raw, (W, 620))
+        fm = Image.new("L", (1, 620))
+        for yy in range(620):
+            fm.putpixel((0, yy), int(255 * max(0, min(1, (620 - yy) / 300)) ** 1.1))
+        back.paste(topb, (0, 0), fm.resize((W, 620)))
+    sh = Image.new("L", (1, H))
+    for yy in range(H):                                  # escurece o miolo e o fim p/ os painéis lerem bem
+        sh.putpixel((0, yy), int(130 * max(0, (yy - 330) / (H - 330)) ** 1.1))
+    back = Image.composite(Image.new("RGB", (W, H), "#05060d"), back, sh.resize((W, H)))
+    img = back.convert("RGBA")
+    d = ImageDraw.Draw(img)
+
+    def T(xy, text, size, fill, bold=False, anchor="la"):
+        font = get_font(size, bold)
+        try:
+            d.text(xy, str(text), font=font, fill=fill, anchor=anchor)
+        except (TypeError, ValueError):
+            d.text(xy, str(text), font=font, fill=fill)
+
+    def panel_(box, r=30, a=185, border=True, fill=None):
+        nonlocal img, d
+        ov = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        ImageDraw.Draw(ov).rounded_rectangle(box, radius=r, fill=(fill or (9, 8, 22)) + (a,),
+                                             outline=(ac + (140,)) if border else None, width=3)
+        img = Image.alpha_composite(img, ov)
+        d = ImageDraw.Draw(img)
+
+    def put(im, xy):
+        nonlocal img, d
+        img.alpha_composite(im.convert("RGBA"), (int(xy[0]), int(xy[1])))
+        d = ImageDraw.Draw(img)
+
+    def ico(name, size, color):
+        return icon_pil(name, size, color).convert("RGBA").resize((size, size), Image.LANCZOS)
+
+    def glow_text(xy, text, size, anchor="mm", col="#ffffff", gcol=None, blur=14):
+        nonlocal img, d
+        font = get_font(size, True)
+        lay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        ImageDraw.Draw(lay).text(xy, text, font=font, fill=hex_rgba(gcol or accent, 255), anchor=anchor)
+        img = Image.alpha_composite(img, lay.filter(ImageFilter.GaussianBlur(blur)))
+        img = Image.alpha_composite(img, lay.filter(ImageFilter.GaussianBlur(3)))
+        d = ImageDraw.Draw(img)
+        d.text(xy, text, font=font, fill=col, anchor=anchor, stroke_width=2, stroke_fill=mix(accent, "#000000", .35))
+
+    def ornament(cx, yy, half=150):
+        d.line([cx - half, yy, cx - 26, yy], fill=ac + (200,), width=2)
+        d.line([cx + 26, yy, cx + half, yy], fill=ac + (200,), width=2)
+        sparkle(d, cx, yy, 11, soft)
+
+    # ---- cabeçalho ----
+    T((W / 2, 70), "M E U   A N O   E M", 30, soft, True, "mm")
+    glow_text((W / 2, 170), "LEITURAS", 150)
+    ornament(W / 2, 252, 190)
+    T((W / 2, 304), str(y), 64, "#ffffff", True, "mm")
+    T((W / 2, 356), "Mais histórias. Mais mundos. A mesma paixão.", 26, soft, False, "mm")
+
+    # ---- perfil ----
+    PY0, PY1 = 386, 586
+    panel_([40, PY0, W - 40, PY1], r=34)
+    AV = 150
+    ap = profile_dir() / pr["avatar"] if pr.get("avatar") else None
+    lv = level_info(xp_breakdown(app)[1])
+    av = avatar_pil(ap, pr["name"], AV, navy, accent)
+    am = Image.new("L", (AV * 4, AV * 4), 0)
+    ImageDraw.Draw(am).ellipse([0, 0, AV * 4 - 1, AV * 4 - 1], fill=255)
+    gl = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    ImageDraw.Draw(gl).ellipse([70 - 5, PY0 + 25 - 5, 70 + AV + 5, PY0 + 25 + AV + 5], fill=ac + (160,))
+    img = Image.alpha_composite(img, gl.filter(ImageFilter.GaussianBlur(12)))
+    img.paste(av, (70, PY0 + 25), am.resize((AV, AV), Image.LANCZOS))
+    d = ImageDraw.Draw(img)
+    X = 70 + AV + 36
+    maxw = W - X - 70
+    T((X, PY0 + 22), _fit_text(d, pr["name"], get_font(56, True), maxw), 56, "#ffffff", True)
+    T((X, PY0 + 90), _fit_text(d, pr["handle"], get_font(28), maxw), 28, "#c9cde6")
+    ttl_, tcol_ = display_title(app, lv)
+    lab_lv = f"Nível {lv['level']} • {ttl_}"
+    cfont = get_font(24, True)
+    if d.textlength(lab_lv, font=cfont) + 90 > maxw:
+        lab_lv = f"Nível {lv['level']}"
+    lwid = d.textlength(lab_lv, font=cfont)
+    ly = PY0 + 130
+    d.rounded_rectangle([X, ly, X + lwid + 76, ly + 44], radius=22, fill=mix(tcol_, navy, .82), outline=tcol_, width=2)
+    put(ico("crown", 26, tcol_), (X + 14, ly + 9))
+    T((X + 50, ly + 22), lab_lv, 24, tcol_, True, "lm")
+
+    # ---- números ----
+    cells = [("book", str(len(st["done"])), "leituras completas"), ("library", str(st["chapters"]), "capítulos lidos"),
+             ("clock", fmt_minutes(st["mins"]), "de leitura"), ("star", _fmt_avg(st["avg"]), "nota média")]
+    SY0, SY1 = 616, 770
+    panel_([40, SY0, W - 40, SY1], r=30)
+    cw_ = (W - 80) / 4
+    for k_, (ic, val, lab) in enumerate(cells):
+        cx_ = 40 + cw_ * k_ + cw_ / 2
+        if k_:
+            d.line([40 + cw_ * k_, SY0 + 24, 40 + cw_ * k_, SY1 - 24], fill=ac + (90,), width=2)
+        put(ico(ic, 32, "#c9cde6"), (cx_ - 16, SY0 + 14))
+        size = 56
+        while size > 28 and d.textlength(val, font=get_font(size, True)) > cw_ - 28:
+            size -= 4
+        T((cx_, SY0 + 82), val, size, "#ffffff", True, "mm")
+        T((cx_, SY0 + 124), lab, 22, "#aab0cc", False, "mm")
+
+    # ---- gêneros ----
+    gy = 800
+    top3 = [t for t, _ in st["genres"].most_common(3)]
+    put(ico("target", 34, accent), (48, gy + 6))
+    T((96, gy + 24), "Gêneros favoritos", 36, "#ffffff", True, "lm")
+    d.line([96 + d.textlength("Gêneros favoritos", font=get_font(36, True)) + 24, gy + 24, W - 50, gy + 24],
+           fill=ac + (110,), width=2)
+    px = 50
+    pf = get_font(27, True)
+    for n_, t in enumerate(top3 or ["—"]):
+        label = _fit_text(d, t, pf, 260)
+        lw_ = d.textlength(label, font=pf)
+        panel_([px, gy + 56, px + lw_ + 92, gy + 114], r=29, a=210, fill=tuple(hex_rgba(mix(accent, navy, .8), 255)[:3]))
+        put(ico(("flame", "target", "gem")[n_ % 3], 26, accent), (px + 20, gy + 72))
+        T((px + 58, gy + 86), label, 27, "#ffffff", True, "lm")
+        px += lw_ + 92 + 14
+
+    # ---- melhores leituras ----
+    by0, by1 = 940, 1390
+    panel_([40, by0, W - 40, by1], r=34)
+    put(ico("book", 40, accent), (68, by0 + 22))
+    T((124, by0 + 42), f"Minhas {len(st['top']) or 5} melhores leituras", 38, "#ffffff", True, "lm")
+    put(ico("crown", 38, mix(accent, "#ffffff", .3)), (W - 40 - 24 - 38, by0 + 22))
+    top = st["top"]
+    if not top:
+        T((W / 2, by0 + 220), "Complete leituras no ano para elas aparecerem aqui", 28, "#aab0cc", False, "mm")
+    CW, CH = 168, 240
+    n = max(1, len(top))
+    cgap = (W - 80 - 40 - n * CW) / (n + 1) if n > 1 else (W - 80 - CW) / 2
+    cy = by0 + 92
+    rmask = Image.new("L", (CW * 4, CH * 4), 0)
+    ImageDraw.Draw(rmask).rounded_rectangle([0, 0, CW * 4 - 1, CH * 4 - 1], radius=56, fill=255)
+    rmask = rmask.resize((CW, CH), Image.LANCZOS)
+    for k_, it in enumerate(top):
+        x = int(60 + cgap * (k_ + 1) + k_ * CW)
+        try:
+            cp = covers_dir() / it["cover"] if it.get("cover") else None
+            cov = Image.open(cp).convert("RGB") if cp and cp.exists() else placeholder(it["title"])
+        except OSError:
+            cov = placeholder(it["title"])
+        cov = ImageOps.fit(cov.convert("RGB"), (CW, CH))
+        first = k_ == 0
+        sh_ = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        ImageDraw.Draw(sh_).rounded_rectangle([x, cy + 10, x + CW, cy + CH + 12], radius=22, fill=(0, 0, 0, 180))
+        img = Image.alpha_composite(img, sh_.filter(ImageFilter.GaussianBlur(10)))
+        img.paste(cov, (x, cy), rmask)
+        d = ImageDraw.Draw(img)
+        d.rounded_rectangle([x, cy, x + CW, cy + CH], radius=20, outline=GOLD_HEX if first else ac, width=4 if first else 3)
+        rc = GOLD_HEX if first else accent
+        d.ellipse([x + 8, cy + 8, x + 44, cy + 44], fill=rc)
+        T((x + 26, cy + 26), k_ + 1, 22, "#1a1206" if first else "#ffffff", True, "mm")
+        tf = get_font(20, True)
+        for j, line in enumerate(_wrap(d, it["title"], tf, CW - 4, 2)):
+            T((x + CW / 2, cy + CH + 16 + j * 25), line, 20, "#ffffff", True, "mt")
+        if it["rating"]:
+            T((x + CW / 2, cy + CH + 16 + 2 * 25 + 8), "Nota " + f"{it['rating']:.1f}".replace(".", ","), 21, GOLD_HEX,
+              True, "mt")
+
+    # ---- curiosidades ----
+    g1, t1 = st["genres"].most_common(1), st["types"].most_common(1)
+    facts = [("calendar", str(y), "um ano de leituras"),
+             ("heart", g1[0][0] if g1 else "–", "gênero favorito"),
+             ("play", t1[0][0] if t1 else "–", "tipo favorito"),
+             ("flame", MESES_LONGOS[st["best_m"]].capitalize() if st["best_m"] is not None else "–", "mês mais ativo"),
+             ("chart", f"{st['longest']} dias" if st["longest"] else "–", "maior sequência")]
+    FY0, FY1 = 1416, 1530
+    panel_([40, FY0, W - 40, FY1], r=28)
+    fw = (W - 80) / len(facts)
+    for k_, (ic, val, lab) in enumerate(facts):
+        cx_ = 40 + fw * k_ + fw / 2
+        if k_:
+            d.line([40 + fw * k_, FY0 + 20, 40 + fw * k_, FY1 - 20], fill=ac + (80,), width=2)
+        if ic == "calendar":                                   # (sem ícone de calendário no app: desenha um)
+            x0_, y0_ = cx_ - 15, FY0 + 14
+            d.rounded_rectangle([x0_, y0_, x0_ + 30, y0_ + 28], radius=5, outline=accent, width=3)
+            d.line([x0_, y0_ + 9, x0_ + 30, y0_ + 9], fill=accent, width=3)
+            d.line([x0_ + 8, y0_ - 4, x0_ + 8, y0_ + 4], fill=accent, width=3)
+            d.line([x0_ + 22, y0_ - 4, x0_ + 22, y0_ + 4], fill=accent, width=3)
+        else:
+            put(ico(ic, 30, accent), (cx_ - 15, FY0 + 12))
+        vf = 28
+        while vf > 18 and d.textlength(val, font=get_font(vf, True)) > fw - 18:
+            vf -= 2
+        T((cx_, FY0 + 66), val, vf, "#ffffff", True, "mm")
+        T((cx_, FY0 + 94), lab, 18, "#aab0cc", False, "mm")
+
+    # ---- rodapé ----
+    FY = 1550
+    put(logo_pil(54, accent), (W / 2 - 150, FY + 6))
+    T((W / 2 - 84, FY + 33), "Leitura Foda", 32, "#ffffff", True, "lm")
+    T((W / 2, FY + 82), "Enquanto houver histórias, haverá leitura.", 20, "#9aa0c0", False, "mm")
+    img.convert("RGB").save(path, "PNG")
+
+
+class YearReviewPage(ImgPage):
+    MAXW = 1150
 
     def __init__(self, app, year=None):
         super().__init__(app, "Retrospectiva", back=True)
         self.review_year = year or date.today().year
-        years = sorted({y for i in app.items for y in (year_of(i["finished"]), year_of(i["started"])) if y}
-                       | {date.today().year}, reverse=True)
-        top = ctk.CTkFrame(self.col, fg_color="transparent")
-        top.pack(fill="x", pady=(0, 6))
-        self.ymenu = menu(top, [str(y) for y in years], self.set_year, 110, height=34)
-        self.ymenu.set(str(self.review_year))
-        self.ymenu.pack(side="left")
-        self.body = ctk.CTkFrame(self.col, fg_color="transparent")
-        self.body.pack(fill="x")
-        self.render()
+        self._build()
 
-    def set_year(self, v):
-        self.review_year = int(v)
-        self.render()
-
-    def render(self):
-        for w in self.body.winfo_children():
-            w.destroy()
+    def _build(self):
         app, y = self.app, self.review_year
-        items, act, pre = app.items, app.activity, str(self.review_year)
-        done = [i for i in items if i["status"] == "completo" and year_of(i["finished"]) == y]
-        chapters, mins = sum_activity(act, pre, "ch"), sum_activity(act, pre, "min")
-        rated = [i["rating"] for i in done if i["rating"]]
-
-        hero = ctk.CTkFrame(self.body, fg_color=P["accent"], corner_radius=18)
-        hero.pack(fill="x", pady=(4, 12))
-        ctk.CTkLabel(hero, text=f"Seu {y} em leituras", text_color="white",
-                     font=ctk.CTkFont(size=26, weight="bold")).pack(anchor="w", padx=22, pady=(18, 4))
-        g = ctk.CTkFrame(hero, fg_color="transparent")
-        g.pack(fill="x", padx=14, pady=(0, 18))
-        nums = [(len(done), "completas"), (chapters, "capítulos lidos"), (fmt_minutes(mins), "de leitura"),
-                (f"{sum(rated) / len(rated):.1f}".replace(".", ",") if rated else "–", "nota média")]
-        for k, (v, lab) in enumerate(nums):
-            c = ctk.CTkFrame(g, fg_color="transparent")
-            c.grid(row=0, column=k, padx=8, sticky="w")
-            ctk.CTkLabel(c, text=str(v), text_color="white", font=ctk.CTkFont(size=30, weight="bold")).pack(anchor="w")
-            ctk.CTkLabel(c, text=lab, text_color="white", font=ctk.CTkFont(size=12)).pack(anchor="w")
-            g.grid_columnconfigure(k, weight=1)
-
-        if not done and not chapters:
-            ctk.CTkLabel(self.body, text=f"Nada registrado em {y} ainda. Complete leituras e use o +1 capítulo "
-                         "ou o cronômetro para alimentar a retrospectiva.", text_color=P["muted"],
-                         wraplength=520, justify="left").pack(anchor="w", pady=20)
+        self.st, self.pst = review_stats(app, y), review_stats(app, y - 1)
+        st, pst = self.st, self.pst
+        self.hero = spec_rv_hero(app, self, st, pst)
+        if _rv_empty(st):
+            self.cards, self.best = [spec_rv_empty(y)], None
             return
+        self.best = spec_rv_best(app, st) if st["top"] else None
+        self.wide1 = spec_rv_months(st, pst)
+        self.cards = [spec_rv_hours(st), spec_rv_compare(st, pst), spec_rv_genres(st), spec_rv_types(st)]
+        self.facts = spec_rv_facts(st)
+        self.badges = spec_rv_badges(st)
 
-        genres, types = Counter(t for i in done for t in i["tags"]), Counter(i["type"] for i in done)
-        months = Counter()
-        for k, v in act.items():
-            if k.startswith(pre):
-                months[int(k[5:7])] += v.get("ch", 0)
-        best = max(months.items(), key=lambda kv: kv[1]) if months and max(months.values()) > 0 else None
-        longest = streaks({k: v for k, v in act.items() if k.startswith(pre)})[1]
-        f, _ = panel(self.body, "Em destaque")
-        f.pack(fill="x", pady=(0, 12))
-        for lab, val in (("Gênero mais lido", genres.most_common(1)[0][0] if genres else "–"),
-                         ("Tipo mais lido", types.most_common(1)[0][0] if types else "–"),
-                         ("Mês mais ativo", f"{MESES_LONGOS[best[0] - 1]} ({best[1]} capítulos)" if best else "–"),
-                         ("Maior sequência", f"{longest} dias" if longest else "–")):
-            r = ctk.CTkFrame(f, fg_color="transparent")
-            r.pack(fill="x", padx=16, pady=3)
-            ctk.CTkLabel(r, text=lab, text_color=P["muted"], width=150, anchor="w").pack(side="left")
-            ctk.CTkLabel(r, text=val, text_color=P["text"], font=ctk.CTkFont(size=14, weight="bold")).pack(side="left")
-        ctk.CTkFrame(f, width=1, height=10, fg_color="transparent").pack()
+    def set_year(self, y):
+        self.review_year = y
+        self._build()
+        try:
+            self.view.cv.yview_moveto(0)
+        except tk.TclError:
+            pass
+        self.view.rebuild()
 
-        top = sorted(done, key=lambda i: (-i["rating"], -i["seen"]))[:5]
-        if top:
-            f, _ = panel(self.body, "Melhores leituras do ano")
-            f.pack(fill="x")
-            row = ctk.CTkFrame(f, fg_color="transparent")
-            row.pack(fill="x", padx=10, pady=(0, 14))
-            for n, it in enumerate(top):
-                app.tile(row, it, 130, bg=P["surface"]).grid(row=0, column=n, padx=6, sticky="n")
+    def share(self):
+        st = self.st
+        p = filedialog.asksaveasfilename(parent=self.app, defaultextension=".png",
+                                         initialfile=f"minha_retrospectiva_{st['year']}.png",
+                                         filetypes=[("Imagem PNG", "*.png")])
+        if not p:
+            return
+        try:
+            make_year_card(self.app, st, p)
+        except Exception as e:
+            return messagebox.showerror("Erro", f"Não consegui gerar a imagem:\n{e}", parent=self.app)
+        self.app.bump("share")
+        self.app.toast("Cartão do ano salvo! Agora é só postar.")
+
+    def layout(self, avail):
+        pad = max(14, int((avail - self.MAXW) // 2)) + 8
+        W = int(avail - 2 * pad)
+        n = 2 if W >= 760 else 1
+        gap = 16
+        out, y = [], 8
+        out.append(self.hero("hero", pad, y, W))
+        y += RV_HERO_H + gap
+        if self.best is not None:
+            h = self.best.nat(W)
+            b = self.best.block("best", pad, y, W, h)
+            top = self.st["top"]
+            b.item = lambda name: top[int(name[2:])] if isinstance(name, str) and name.startswith("w:") else None
+            out.append(b)
+            y += h + gap
+        if _rv_empty(self.st):
+            for k_, sp in enumerate(self.cards):
+                h = sp.nat(W)
+                out.append(sp.block(f"e{k_}", pad, y, W, h))
+                y += h + gap
+            return out
+        h = self.wide1.nat(W)
+        out.append(self.wide1.block("months", pad, y, W, h))
+        y += h + gap
+        cw = (W - gap * (n - 1)) // n
+        for r0 in range(0, len(self.cards), n):
+            grp = self.cards[r0:r0 + n]
+            hmax = max(sp.nat(cw) for sp in grp)
+            for c, sp in enumerate(grp):
+                out.append(sp.block(f"c{r0 + c}", pad + c * (cw + gap), y, cw, hmax))
+            y += hmax + gap
+        for name, sp in (("facts", self.facts), ("badges", self.badges)):
+            h = sp.nat(W)
+            out.append(sp.block(name, pad, y, W, h))
+            y += h + gap
+        return out
 
 
 class TierPage(Page):
@@ -8598,7 +9790,7 @@ class TierPage(Page):
             try:
                 self.after_cancel(self._job)
             except Exception:
-                pass
+                log_error()
         self._job = self.after(60, self.relayout)
 
     def _by_id(self):
@@ -8760,7 +9952,7 @@ class TierPage(Page):
                 # a capa acompanha o cursor mesmo com a página rolando
                 self.after(30, lambda: self._follow())
         except Exception:
-            pass
+            log_error()
 
     def _follow(self):
         d = self.drag
@@ -8967,9 +10159,30 @@ class SettingsPage(Page):
         self.opts = {}
         for key, text in (("anim", "Animações suaves"), ("splash", "Tela de abertura ao iniciar"),
                           ("preview", "Prévia ao passar o mouse nas capas"),
-                          ("sounds", "Sons suaves ao completar uma obra ou ganhar uma conquista")):
+                          ("auto_pause", "Pausar sozinho obras em lançamento que já estão em dia"),
+                          ("sounds", "Sons suaves ao completar uma obra ou ganhar uma conquista"),
+                          ("overlay", "Mostrar conquistas por cima de outras janelas (como na Steam)")):
             self.opts[key] = tk.BooleanVar(value=bool(S.get(key, True)))
             check(f, text, self.opts[key], lambda k=key: self.save_opt(k)).pack(anchor="w", padx=16, pady=(0, 6))
+        tr = ctk.CTkFrame(f, fg_color="transparent")
+        tr.pack(anchor="w", padx=16, pady=(0, 6))
+        flat_button(tr, "▶ Testar som de obra", lambda: play_sound("done", True), width=170, height=32).pack(
+            side="left", padx=(0, 8))
+        flat_button(tr, "▶ Testar som de conquista", lambda: play_sound("badge", True), width=190, height=32).pack(
+            side="left")
+        ctk.CTkLabel(f, text="Testar aviso de conquista (por cima das outras janelas)", text_color=P["muted"],
+                     anchor="w").pack(fill="x", padx=16, pady=(8, 2))
+        tr2 = ctk.CTkFrame(f, fg_color="transparent")
+        tr2.pack(anchor="w", padx=16, pady=(0, 6))
+        ctk.CTkLabel(tr2, text="Aparece depois de", text_color=P["muted"]).pack(side="left", padx=(0, 6))
+        self.test_secs = entry(tr2, "5", width=52)
+        self.test_secs.insert(0, "5")
+        self.test_secs.pack(side="left", padx=(0, 6))
+        ctk.CTkLabel(tr2, text="seg", text_color=P["muted"]).pack(side="left", padx=(0, 12))
+        flat_button(tr2, "Conquista comum", lambda: self.test_badge("ouro"), width=140, height=32).pack(
+            side="left", padx=(0, 8))
+        flat_button(tr2, "Conquista platina", lambda: self.test_badge("platina"), width=150, height=32).pack(
+            side="left")
         ctk.CTkFrame(f, width=1, height=6, fg_color="transparent").pack()
 
         f = self.card("Seus dados")
@@ -8985,6 +10198,15 @@ class SettingsPage(Page):
         flat_button(row, "Importar backup...", self.import_).pack(side="left")
         self.note(f, "Backup automático: toda vez que você fecha o app, ele guarda uma cópia em “backups” "
                      "dentro da pasta de dados (as últimas 7). O backup inclui lista, capas, perfil e histórico.", (4, 14))
+
+        f = self.card("Lixeira")
+        self.trash_host = ctk.CTkFrame(f, fg_color="transparent")
+        self.trash_host.pack(fill="x", padx=16, pady=(0, 6))
+        self.note(f, "Leituras excluídas ficam aqui por 30 dias e podem ser restauradas com capa e prints.", (0, 6))
+        row = ctk.CTkFrame(f, fg_color="transparent")
+        row.pack(anchor="w", padx=16, pady=(0, 14))
+        flat_button(row, "Abrir log de erros", self.open_log).pack(side="left")
+        self.fill_trash()
 
         f = self.card("Leitura parada")
         r = ctk.CTkFrame(f, fg_color="transparent")
@@ -9126,12 +10348,33 @@ class SettingsPage(Page):
         try:
             ctk.set_widget_scaling(UI["ws"])
         except Exception:
-            pass
+            log_error()
         _icon_cache.clear()
         self.app.images.clear()
         app = self.app
         app.rebuild()
         app.nav("settings")
+
+    def test_badge(self, tier):
+        """Dispara uma conquista de mentira depois de alguns segundos (dá tempo de trocar de janela)."""
+        try:
+            secs = max(0, min(120, int(float(self.test_secs.get().replace(",", ".")))))
+        except ValueError:
+            secs = 5
+        app = self.app
+        if tier == "platina":
+            b = dict(id="teste_plat", title="Conquista de teste", desc="Assim aparece uma conquista de platina.",
+                     icon="crown", tier="platina", ptitle="Título de teste")
+        else:
+            b = dict(id="teste", title="Conquista de teste", desc="Assim aparece uma conquista normal.",
+                     icon="trophy", tier="ouro", ptitle="Título de teste")
+        app.toast(f"Aviso de teste em {secs} s — pode trocar de janela.")
+
+        def fire():
+            app._badge_q = getattr(app, "_badge_q", []) + [b]
+            if getattr(app, "_badge_w", None) is None:
+                app._badge_next()
+        app.after(secs * 1000, fire)
 
     def save_opt(self, key):
         S[key] = bool(self.opts[key].get())
@@ -9173,6 +10416,7 @@ class SettingsPage(Page):
         if not messagebox.askyesno("Importar CSV", f"Adicionar {len(new)} leituras à sua lista?", parent=self.app):
             return
         self.app.items.extend(new)
+        unify_names(self.app.items)
         save_items(self.app.items)
         self.app.images.clear()
         self.app.toast(f"{len(new)} leituras adicionadas")
@@ -9199,6 +10443,37 @@ class SettingsPage(Page):
         if c:
             self.set_accent(c)
 
+    def fill_trash(self):
+        for w in self.trash_host.winfo_children():
+            w.destroy()
+        ents = list_trash()
+        if not ents:
+            ctk.CTkLabel(self.trash_host, text="A lixeira está vazia.", text_color=P["muted"]).pack(anchor="w")
+            return
+        for d, it, ts in ents[:12]:
+            r = ctk.CTkFrame(self.trash_host, fg_color="transparent")
+            r.pack(fill="x", pady=2)
+            days = int((time.time() - ts) // 86400)
+            when = "hoje" if days <= 0 else f"há {days} dia" + ("s" if days != 1 else "")
+            ctk.CTkLabel(r, text=f"{it.get('title', '?')}", text_color=P["text"], anchor="w").pack(side="left")
+            ctk.CTkLabel(r, text=f"  excluída {when}", text_color=P["muted"]).pack(side="left")
+            flat_button(r, "Restaurar", lambda d=d: self.restore_from_trash(d), width=90, height=28).pack(side="right")
+        if len(ents) > 12:
+            ctk.CTkLabel(self.trash_host, text=f"+ {len(ents) - 12} mais antigas", text_color=P["muted"]).pack(anchor="w")
+
+    def restore_from_trash(self, d):
+        self.app.restore_item(d)
+        self.fill_trash()
+
+    def open_log(self):
+        p = data_dir() / "erros.log"
+        if not p.exists():
+            return self.app.toast("Nenhum erro registrado até agora.")
+        try:
+            webbrowser.open(str(p))
+        except Exception:
+            log_error("abrir log")
+
     def change_folder(self):
         new = filedialog.askdirectory(parent=self.app, title="Escolha a pasta de salvamento")
         if not new or Path(new) == data_dir():
@@ -9212,12 +10487,14 @@ class SettingsPage(Page):
             save_items(self.app.items)
             save_profile(self.app.profile)
             save_activity(self.app.activity)
+            flush_saves()
             new.mkdir(parents=True, exist_ok=True)
             for f, n in ((data_file(), "data.json"), (profile_file(), "profile.json"),
                          (activity_file(), "activity.json")):
                 if f.exists():
                     shutil.copy2(f, new / n)
-            for d, n in ((covers_dir(), "covers"), (profile_dir(), "profile"), (shots_dir(), "shots")):
+            for d, n in ((covers_dir(), "covers"), (profile_dir(), "profile"), (shots_dir(), "shots"),
+                         (trash_dir(), "trash")):
                 if d.exists():
                     shutil.copytree(d, new / n, dirs_exist_ok=True)
         S["data_dir"] = str(new)
@@ -9247,7 +10524,7 @@ class SettingsPage(Page):
         try:
             with zipfile.ZipFile(p) as z:
                 items = json.loads(z.read("data.json").decode("utf-8"))
-                if not isinstance(items, list):
+                if not isinstance(items, list) or not all(isinstance(i, dict) for i in items):
                     raise ValueError
                 if not messagebox.askyesno("Importar backup", "Isso substitui a lista atual pela do backup. "
                                            "Uma cópia da lista atual será guardada antes. Continuar?",
@@ -9273,8 +10550,8 @@ class SettingsPage(Page):
                     else:
                         continue
                     dst.parent.mkdir(parents=True, exist_ok=True)
-                    dst.write_bytes(z.read(n))
-                data_file().write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+                    atomic_write(dst, z.read(n))
+                atomic_write(data_file(), json.dumps(items, ensure_ascii=False, indent=2))
         except (OSError, KeyError, ValueError, zipfile.BadZipFile):
             return messagebox.showerror("Erro", "Esse arquivo não parece um backup do Leitura Foda.",
                                         parent=self.app)
@@ -9633,7 +10910,7 @@ class VGrid:
             try:
                 self.app.after_cancel(self._job)
             except Exception:
-                pass
+                log_error()
             self._job = None
 
     # ---- posições ----
@@ -9680,7 +10957,7 @@ class VGrid:
             try:
                 self.app.after_cancel(self._rz)
             except Exception:
-                pass
+                log_error()
         self._rz = self.app.after(60, self._do_resize)
 
     def _do_resize(self):
@@ -9845,7 +11122,6 @@ class NoFab:
     def reposition(self): pass
 
 
-
 # ---------- mini janela ----------
 class MiniWindow(tk.Toplevel):
     """Janelinha flutuante: capa, cronômetro e +1, tudo desenhado numa imagem só."""
@@ -9954,7 +11230,7 @@ class MiniWindow(tk.Toplevel):
                 d.rounded_rectangle([96 * K, 72 * K, (96 + max(fw, 6)) * K, 77 * K], radius=3 * K, fill=col)
             t_ = app.timer
             run = bool(t_ and t_["id"] == it["id"])
-            e = int(time.time() - t_["start"]) if run else 0
+            e = timer_secs(t_) if run else 0
             T(d, 96, 108, f"{e // 3600:02d}:{e % 3600 // 60:02d}:{e % 60:02d}", 19, P["text"] if run else P["muted"],
               True, "lm")
             on = self.hov == "play"
@@ -10138,14 +11414,19 @@ class App(ctk.CTk):
         self._t0 = time.time()
         self._init_window()
         self.withdraw()
-        splash = show_splash(self) if S.get("splash", True) else None
+        splash = self._splash = show_splash(self) if S.get("splash", True) else None
         splash_step(splash, 0.2)
         self.items = load_items()
         self.profile = load_profile()
         self.activity = load_activity()
+        if sum(1 for i in self.items if resume_if_new(i) or pause_if_caught_up(i)):
+            save_items(self.items)
+        self.after(1800000, self._auto_pause_tick)
+        self.after(4000, self._timer_tick)
+        self.after(8000, lambda: threading.Thread(target=ensure_daily_backup, daemon=True).start())
         splash_step(splash, 0.4)
         self.timer = None
-        self.images = {}
+        self.images = LRUDict(900)            # imagens prontas (limitado: as menos usadas saem)
         self._pilc = OrderedDict()            # capas prontas (limitado, as mais antigas saem)
         self.cache = {}                       # nome da tela -> (tela pronta, versão dos dados)
         self._lib_ver, self._lib_dirty, self._user_ver = -1, True, -1
@@ -10188,6 +11469,8 @@ class App(ctk.CTk):
     # --- estrutura geral ---
     def build(self):
         for w in self.winfo_children():
+            if w is getattr(self, "_splash", None):      # a tela de abertura é fechada só no fim
+                continue
             w.destroy()
         self.page, self.lib_shown, self._side_state = None, False, None
         self.cache, self._lib_dirty = {}, True
@@ -10321,7 +11604,7 @@ class App(ctk.CTk):
         try:
             tk.Frame.pack_configure(self.main, padx=(px(w), 0))
         except Exception:
-            pass
+            log_error()
 
     def apply_sidebar(self):
         c = self.want_collapsed()
@@ -10335,7 +11618,7 @@ class App(ctk.CTk):
             try:
                 self.after_cancel(job)
             except Exception:
-                pass
+                log_error()
             self._side_job = None
         start = getattr(self, "_side_w", None)
         if first or start is None or not S.get("anim", True) or abs(start - target) < 2:
@@ -10385,19 +11668,17 @@ class App(ctk.CTk):
         return None
 
     def pick_item(self, cb):
-        its = sorted(self.items, key=lambda i: (i["status"] != "lendo", -(i.get("updated") or 0)))[:30]
+        its = sorted(self.items, key=lambda i: (i["status"] != "lendo", -(i.get("updated") or 0)))[:60]
         if not its:
             return self.toast("Adicione uma leitura primeiro.", "warn")
-        m = tk.Menu(self, tearoff=0, bg=P["surface"], fg=P["text"], activebackground=P["surface2"],
-                    activeforeground=P["text"], bd=0, relief="flat", font=("TkDefaultFont", fpt(11)))
-        m.add_command(label="Em qual obra?", state="disabled")
+        labels = {}
         for i in its:
             t = i["title"] if len(i["title"]) < 42 else i["title"][:40] + "…"
-            m.add_command(label=t, command=lambda i=i: cb(i))
-        try:
-            m.tk_popup(self.winfo_pointerx(), self.winfo_pointery())
-        finally:
-            m.grab_release()
+            while t in labels:
+                t += " "
+            labels[t] = i
+        list_popup(self, self.winfo_pointerx(), self.winfo_pointery(), px(380), list(labels), None,
+                   lambda k: cb(labels[k]), above_y=self.winfo_pointery(), title="Em qual obra?")
 
     def add_shot_files(self, it=None):
         it = self._shots_target(it)
@@ -10453,7 +11734,7 @@ class App(ctk.CTk):
             elif isinstance(pg, GalleryPage):
                 pg.view.rebuild()
         except Exception:
-            pass
+            log_error()
 
     def _ctrl_v(self, e):
         if isinstance(self.page, (DetailPage, GalleryPage)):
@@ -10467,7 +11748,7 @@ class App(ctk.CTk):
                 pg._sync_top(())
                 pg.sync_timer()
             except Exception:
-                pass
+                log_error()
 
     def bump(self, key):
         """Conta um uso (mini janela, compartilhar...) no perfil, para as conquistas."""
@@ -10563,7 +11844,7 @@ class App(ctk.CTk):
             try:
                 ent[0].destroy()
             except Exception:
-                pass
+                log_error()
         self.page = cls(self)
         self.cache[name] = (self.page, DATA["v"])
         self.page.pack(fill="both", expand=True)
@@ -10625,7 +11906,7 @@ class App(ctk.CTk):
             try:
                 v.destroy()
             except Exception:
-                pass
+                log_error()
 
     def open_sub(self, cls, *args):
         if self.back is None:
@@ -10661,44 +11942,17 @@ class App(ctk.CTk):
         else:
             self.fab.hide()
 
-    def _reveal(self, widget):
-        """Transição suave: uma cortina da cor do fundo que sobe, revelando a tela nova."""
-        if not S.get("anim", True):
-            return
-        try:
-            cover = tk.Frame(widget, bg=P["bg"], bd=0, highlightthickness=0)
-            cover.place(x=0, y=0, relwidth=1, relheight=1)
-            cover.lift()
-
-            def step(k=1):
-                try:
-                    if not cover.winfo_exists():
-                        return
-                    if k >= 6:
-                        cover.destroy()
-                        return
-                    f = k / 6
-                    cover.place_configure(rely=f, relheight=1 - f)
-                    cover.after(16, lambda: step(k + 1))
-                except tk.TclError:
-                    pass
-
-            cover.after(8, step)
-        except Exception:
-            pass
 
     def open_new(self):
         self.open_sub(EditPage)
 
-    def open_edit(self, it):
-        self.open_sub(EditPage, it)
 
     def on_close(self):
         try:
             if self.mini:
                 self.mini.destroy()
         except Exception:
-            pass
+            log_error()
         self._save_window()
         try:
             if self.timer:
@@ -10706,13 +11960,11 @@ class App(ctk.CTk):
             if self.items:
                 save_items(self.items)
                 save_activity(self.activity)
-                d = data_dir() / "backups"
-                d.mkdir(exist_ok=True)
-                make_backup(d / f"auto_{date.today():%Y-%m-%d}.zip")
-                for old in sorted(d.glob("auto_*.zip"))[:-7]:
-                    old.unlink()
+                flush_saves()
+                ensure_daily_backup()
         except OSError:
             pass
+        flush_saves()
         self.destroy()
 
     def _set_icon(self):
@@ -10721,7 +11973,7 @@ class App(ctk.CTk):
             if p.exists():
                 self.iconbitmap(str(p))
         except Exception:
-            pass
+            log_error()
 
     def focus_search(self):
         self.nav("library")
@@ -10765,6 +12017,8 @@ class App(ctk.CTk):
             it["seen"], it["status"] = it["total"], "completo"
             it["finished"] = it["finished"] or today
             add_event(it, "done")
+        elif pause_if_caught_up(it):
+            self.toast(f"“{it['title']}” está em dia — movida para Pausado")
         log_activity(self.activity, ch=n)
         save_activity(self.activity)
         self.commit(it["id"])
@@ -10773,13 +12027,14 @@ class App(ctk.CTk):
     def start_timer(self, it):
         if self.timer:
             self.stop_timer()
-        self.timer = {"id": it["id"], "start": time.time()}
+        now_ = time.time()
+        self.timer = {"id": it["id"], "start": now_, "last": now_, "acc": 0}
 
     def stop_timer(self):
         t, self.timer = self.timer, None
         if not t:
             return 0
-        secs = time.time() - t["start"]
+        secs = timer_secs(t)
         mins = round(secs / 60) if secs >= 30 else 0
         mins = max(mins, 1) if secs >= 30 else 0
         it = next((i for i in self.items if i["id"] == t["id"]), None)
@@ -10815,7 +12070,7 @@ class App(ctk.CTk):
         try:
             tk.Wm.geometry(self, f"+{x}+{y}")
         except Exception:
-            pass
+            log_error()
         self._want_max = bool(win.get("zoomed") or S.get("start_max"))
 
     def _finish_splash(self, sp):
@@ -10825,14 +12080,14 @@ class App(ctk.CTk):
                 if sp is not None:
                     sp.destroy()
             except Exception:
-                pass
+                log_error()
             try:
                 self.deiconify()
                 self.lift()
                 if self._want_max:
                     self._maximize()
             except Exception:
-                pass
+                log_error()
 
         if sp is None:
             show()
@@ -10857,7 +12112,7 @@ class App(ctk.CTk):
             try:
                 self.attributes("-zoomed", True)
             except Exception:
-                pass
+                log_error()
 
     def _save_window(self):
         try:
@@ -10870,7 +12125,7 @@ class App(ctk.CTk):
             S["win"] = win
             save_settings()
         except Exception:
-            pass
+            log_error()
 
     def _bind_wheel(self):
         self.bind_all("<MouseWheel>", self._on_wheel, add="+")
@@ -10905,15 +12160,73 @@ class App(ctk.CTk):
             try:
                 self.after_cancel(self._soon)
             except Exception:
-                pass
+                log_error()
         self._soon = self.after(ms, self.refresh)
 
-    def toast(self, msg, kind="ok", ms=2600):
-        """Aviso discreto no rodapé (some sozinho), no lugar de janelinhas de 'OK'."""
+    def report_callback_exception(self, exc, val, tb):
+        """Erro dentro de um clique/evento da tela: anota no log (sem console o .exe engolia isso)."""
+        log_error("evento da tela", (exc, val, tb))
+
+    def _timer_tick(self):
+        """A cada 5 s: soma o tempo andado ao cronômetro (ignora intervalos em que o PC dormiu) e avisa se
+        alguma gravação falhou."""
+        try:
+            t = self.timer
+            if t:
+                now = time.time()
+                gap = now - t.get("last", now)
+                if gap <= 60:
+                    t["acc"] = t.get("acc", 0) + gap
+                t["last"] = now
+            if LOAD_NOTES:
+                notes = list(dict.fromkeys(LOAD_NOTES))
+                LOAD_NOTES.clear()
+                messagebox.showwarning("Leitura Foda", "\n\n".join(notes), parent=self)
+            if _WFAIL[0]:
+                msg, _WFAIL[0] = _WFAIL[0], None
+                self.toast("Não consegui salvar (" + msg[:60] + "). Vou tentar de novo.", "warn", 6000)
+        except Exception:
+            log_error()
+        self.after(5000, self._timer_tick)
+
+    def _auto_pause_tick(self):
+        """De tempos em tempos: obras em dia vão para Pausado e as que ganharam capítulo voltam para Lendo."""
+        try:
+            if sum(1 for i in self.items if resume_if_new(i) or pause_if_caught_up(i)):
+                save_items(self.items)
+                self.refresh()
+        except Exception:
+            log_error()
+        self.after(1800000, self._auto_pause_tick)
+
+    def restore_item(self, d):
+        it = restore_trash(d)
+        if it is None:
+            return self.toast("Não consegui restaurar essa leitura.", "err")
+        for k, v in DEFAULTS.items():
+            it.setdefault(k, fresh(v))
+        self.items.append(it)
+        self.commit(it["id"])
+        self.toast(f"“{it['title']}” restaurada")
+
+    def toast(self, msg, kind="ok", ms=2600, action=None):
+        """Aviso discreto no rodapé (some sozinho). action=(rótulo, função) põe um botão (ex.: Desfazer)."""
         col = {"ok": P["accent"], "err": DANGER, "warn": P["status"]["pausado"]}.get(kind, P["accent"])
         self._drop_toast()
-        t = ctk.CTkLabel(self.main, text=f"   {msg}   ", fg_color=col, text_color="white", corner_radius=12,
-                         height=40, font=ctk.CTkFont(size=13, weight="bold"))
+        if action:
+            t = ctk.CTkFrame(self.main, fg_color=col, corner_radius=12, height=40)
+            ctk.CTkLabel(t, text=f"   {msg}", text_color="white",
+                         font=ctk.CTkFont(size=13, weight="bold")).pack(side="left", pady=6)
+
+            def go(fn=action[1], t=t):
+                self._drop_toast(t)
+                fn()
+            ctk.CTkButton(t, text=action[0], width=84, height=28, corner_radius=8, fg_color=mix(col, "#000000", .3),
+                          hover_color=mix(col, "#000000", .5), text_color="white",
+                          font=ctk.CTkFont(size=13, weight="bold"), command=go).pack(side="left", padx=(12, 8))
+        else:
+            t = ctk.CTkLabel(self.main, text=f"   {msg}   ", fg_color=col, text_color="white", corner_radius=12,
+                             height=40, font=ctk.CTkFont(size=13, weight="bold"))
         t.place(relx=0.5, rely=1.0, y=-26, anchor="s")
         t.lift()
         self._toast = t
@@ -10927,7 +12240,7 @@ class App(ctk.CTk):
         try:
             t.destroy()
         except Exception:
-            pass
+            log_error()
 
     # --- biblioteca ---
     def build_lib(self):
@@ -11052,7 +12365,7 @@ class App(ctk.CTk):
         """Descobre conquistas novas, guarda a data e mostra o aviso (as que já eram suas entram sem festa)."""
         self._cb_job = None
         try:
-            st = badge_status(self)
+            st = badge_status_cached(self)
         except Exception:
             return
         pr = self.profile
@@ -11153,7 +12466,13 @@ class App(ctk.CTk):
             self._badge_w = None
             return
         b = q.pop(0)
-        play_sound("badge")
+        play_sound("platina" if b["tier"] == "platina" else "badge")
+        if S.get("overlay", True):                        # aviso por cima de tudo (estilo Steam)
+            try:
+                self._badge_w = BadgePopup(self, b, self._badge_next)
+                return
+            except Exception:
+                self._badge_w = None
         rar = badge_rarity(b)
         f = ctk.CTkFrame(self, fg_color=P["surface"], corner_radius=16, border_width=2,
                          border_color=TIER_COLOR[b["tier"]])
@@ -11183,7 +12502,7 @@ class App(ctk.CTk):
                 else:
                     self.after(4800, leave)
             except Exception:
-                pass
+                log_error()
 
         def leave(n=0):
             try:
@@ -11219,7 +12538,7 @@ class App(ctk.CTk):
         try:
             self.scroll._parent_canvas.yview_moveto(pos)
         except Exception:
-            pass
+            log_error()
 
     def grid_params(self):
         try:
@@ -11332,7 +12651,7 @@ class App(ctk.CTk):
             try:
                 shelf_x[t] = sh.canvas.xview()[0]
             except Exception:
-                pass
+                log_error()
         self._shelves = []
         if self.vg is not None:
             self.vg.hide()
@@ -11588,4 +12907,6 @@ class App(ctk.CTk):
 if __name__ == "__main__":
     S.update(load_settings())
     apply_palette()
+    sys.excepthook = lambda *ei: log_error("erro não tratado", ei)
+    threading.excepthook = lambda a: log_error("erro em segundo plano", (a.exc_type, a.exc_value, a.exc_traceback))
     App().mainloop()
